@@ -5,6 +5,7 @@
 --
 -- 检查项：
 --   1. 环境变量是否配置（SGS_AI_URL / SGS_AI_KEY / SGS_AI_MODEL / SGS_AI_REASONING）
+--      或 Jev 决策模型（SGS_AI_ENGINE=jev + SGS_JEV_KEY）
 --   2. 能不能连通（直接 curl / 经本机代理）
 --   3. 单次调用耗时（重点：思维链没关会超过 8 秒，直接提示）
 --   4. 返回的能不能被解析成合法动作（游戏里最核心的要求）
@@ -12,6 +13,8 @@ package.path = "./?.lua;" .. package.path
 
 local Transport = require "src.core.ai.transport"
 local Actions = require "src.core.ai.actions"
+local Jev = require "src.core.ai.jev"
+local Json = require "src.core.json"
 
 local fails, passes = 0, 0
 local function check(cond, msg)
@@ -20,6 +23,56 @@ local function check(cond, msg)
 end
 
 print("== AI 自检 ==")
+
+-- ===== Jev 决策模型分支（SGS_AI_ENGINE=jev）=====
+if os.getenv("SGS_AI_ENGINE") == "jev" then
+  local jkey = os.getenv("SGS_JEV_KEY")
+  local jurl = os.getenv("SGS_JEV_URL") or "https://api.typesafe.ai/v1/systemone"
+  local jmodel = os.getenv("SGS_JEV_MODEL") or "jev-latest"
+  check(jkey and jkey ~= "", "SGS_JEV_KEY 已配置")
+  if not (jkey and jkey ~= "") then
+    print(string.format("自检结束：%d 项通过，%d 项失败（缺密钥，后续跳过）", passes, fails))
+    os.exit(1)
+  end
+  print("（Jev 模式：" .. jurl .. " model=" .. jmodel .. "）")
+  local jt = Transport.curl {
+    url = jurl, api_key = jkey, model = jmodel,
+    protocol = "jev", timeout = 15,
+  }
+  local probe = {
+    state = "你在玩三国杀身份局，你是反贼，体力2/4，手牌：杀、闪、桃。"
+      .. "主公（座位1）体力3/5与你距离1，已亮明身份。",
+    questions = {
+      action = {
+        type = "choice",
+        instructions = "出牌阶段，从下列动作中选最优的",
+        criteria = { a1 = "出【杀】→主公", a2 = "结束出牌" },
+      },
+      lord_rebel = {
+        type = "noul",
+        instructions = "对当前身份目标而言，进攻主公比保留手牌更有利",
+      },
+    },
+  }
+  local t0 = os.time()
+  local r = jt:request(probe)
+  local dt = os.time() - t0
+  check(r.ok, "Jev 能连通并拿到响应（" .. dt .. " 秒，" .. tostring(r.err) .. "）")
+  if r.ok then
+    check(dt <= 5, string.format("Jev 单次调用 %d 秒（官方标称 <1 秒）", dt))
+    local answers, aerr = Jev.answersFrom(r.text)
+    check(answers ~= nil, "响应应含 answers（" .. tostring(aerr) .. "）")
+    if answers then
+      local a = answers.action
+      check(a ~= nil and (a.choice == "a1" or a.choice == "a2"),
+        "choice 应返回候选内的动作（实得 " .. tostring(a and a.choice) .. "）")
+      check(a and a.confidence ~= nil, "choice 应带校准置信度")
+    end
+  end
+  print(string.format("\n自检结束：%d 项通过，%d 项失败", passes, fails))
+  if fails > 0 then os.exit(1) end
+  return
+end
 
 -- 1. 配置
 local url = os.getenv("SGS_AI_URL")

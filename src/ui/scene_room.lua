@@ -280,9 +280,14 @@ function RoomScene:beginPlay()
   -- 思维链开启时单次调用 12 秒以上，Agent 自身的超时也要放宽（默认 30 秒）
   local thinking_on = self.ai_reasoning and self.ai_reasoning ~= "none"
     and self.ai_reasoning ~= ""
+  -- 决策引擎跟随传输层配置：SGS_AI_ENGINE=jev 时 Agent 走 Jev 路线
+  local engine = (os.getenv("SGS_AI_ENGINE") == "jev") and "jev" or "llm"
+  local jev_conf = tonumber(os.getenv("SGS_JEV_MIN_CONFIDENCE") or "") or nil
   self.agent = Agent.create({
     transport = transport,
-    timeout = thinking_on and 140 or nil,
+    engine = engine,
+    jev_min_confidence = jev_conf,
+    timeout = engine == "jev" and 20 or (thinking_on and 140 or nil),
     -- 「正在思考」提示里的名字与面板同款（AI（武将）/BOT（武将））
     name_of = function(p) return self:displayName(p) end,
     -- 用 love.timer 而不是 os.time：os.time 只有秒级精度，超时判断会差一整秒

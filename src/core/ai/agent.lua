@@ -13,6 +13,7 @@ local class = require "src.class"
 local Actions = require "src.core.ai.actions"
 local Prompt = require "src.core.ai.prompt"
 local Parse = require "src.core.ai.parse"
+local Jev = require "src.core.ai.jev"
 local Memory = require "src.core.ai.memory"
 local Card = require "src.core.card"
 
@@ -58,6 +59,11 @@ end
 function Agent:init(opts)
   opts = opts or {}
   self.transport = opts.transport
+  -- 决策引擎："llm"（对话模型，Prompt+Parse 文本路线，默认）
+  --           "jev"（TypeSafe System One 决策模型，state+questions 路线）
+  self.engine = opts.engine == "jev" and "jev" or "llm"
+  -- jev 引擎的置信度门限（choice 低于它走次高概率/机械兜底）
+  self.jev_min_confidence = opts.jev_min_confidence or Jev.DEFAULT_MIN_CONFIDENCE
   -- 全部请求都交给 LLM。设 false 可退回「只问决策类请求」的省流模式。
   self.ask_all = opts.ask_all ~= false
   -- 兜底策略，默认 "retry"（重试 + 机械选择），**不会调用规则 BOT**。
@@ -82,6 +88,7 @@ function Agent:init(opts)
   self.stats = {
     asked = 0, by_ai = 0, retried = 0, mechanical = 0,
     timeouts = 0, errors = {}, rejections = {},
+    low_confidence = 0,
   }
 end
 
@@ -124,6 +131,16 @@ function Agent:_respond(req, room)
 end
 
 function Agent:_buildPrompt(req, room, actions, memory, hint)
+  if self.engine == "jev" then
+    -- Jev 无文本生成，重试没有意义（同样的问题大概率同样的答案），
+    -- hint 只进 state 供参考
+    return Jev.build(room, req, actions, {
+      memory = memory,
+      nameOf = makeNameOf(room),
+      beliefs = self.jev_beliefs_on,
+      retry_hint = hint,
+    })
+  end
   return Prompt.build(room, req, actions, {
     memory = memory,
     nameOf = makeNameOf(room),
@@ -167,15 +184,37 @@ function Agent:_poll(req, room)
     return self:_retryOrMechanical(req, room, res.err or "调用失败")
   end
 
-  local resp, err, extra = Parse.response(res.text, req, room, cur.actions)
-  if err then
-    -- 解析失败时把原始输出打到终端：不同模型/网关的输出形态差异大
-    -- （如推理模型把答案藏进 reasoning_content），没有原文无从排查
-    print(string.format("[AI] 解析失败（%s），原始输出 %d 字节：\n%s",
-      tostring(err), #tostring(res.text), tostring(res.text)))
-    self.stats.rejections[#self.stats.rejections + 1] = err
-    if #self.stats.rejections > 20 then table.remove(self.stats.rejections, 1) end
-    return self:_retryOrMechanical(req, room, err)
+  local resp, err, extra
+  if self.engine == "jev" then
+    local answers, aerr = Jev.answersFrom(res.text)
+    if not answers then
+      err = aerr
+    else
+      resp, err, extra = Jev.map(answers, req, room, cur.actions,
+        cur.prompt.jev_ctx, self.jev_min_confidence)
+      if err then
+        self.stats.low_confidence = self.stats.low_confidence + 1
+      end
+    end
+    if err then
+      print(string.format("[AI/jev] 决策未通过（%s）", tostring(err)))
+      self.stats.rejections[#self.stats.rejections + 1] = tostring(err)
+      if #self.stats.rejections > 20 then table.remove(self.stats.rejections, 1) end
+      -- Jev 是无状态决策器，重问同一问题没有意义：直接走机械兜底
+      self.current = nil
+      return self:_mechanical(req, room, "jev：" .. tostring(err)), "ready"
+    end
+  else
+    resp, err, extra = Parse.response(res.text, req, room, cur.actions)
+    if err then
+      -- 解析失败时把原始输出打到终端：不同模型/网关的输出形态差异大
+      -- （如推理模型把答案藏进 reasoning_content），没有原文无从排查
+      print(string.format("[AI] 解析失败（%s），原始输出 %d 字节：\n%s",
+        tostring(err), #tostring(res.text), tostring(res.text)))
+      self.stats.rejections[#self.stats.rejections + 1] = err
+      if #self.stats.rejections > 20 then table.remove(self.stats.rejections, 1) end
+      return self:_retryOrMechanical(req, room, err)
+    end
   end
 
   self.stats.by_ai = self.stats.by_ai + 1

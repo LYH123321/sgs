@@ -38,6 +38,14 @@ local DEFAULT_PROTOCOL = "chat"
 
 local function buildBody(self, prompt)
   local protocol = self.protocol or DEFAULT_PROTOCOL
+  -- jev 协议（TypeSafe System One）：请求体就是 state/questions 表，
+  -- 没有 system/messages 结构。响应解析也不同：text 放**整个原始 JSON**，
+  -- 由 core/ai/jev.lua 的 answersFrom 解出 answers（见 parseResponse）。
+  if protocol == "jev" then
+    local body = { state = prompt.state, questions = prompt.questions }
+    if self.model and self.model ~= "" then body.model = self.model end
+    return Json.encode(body)
+  end
   -- model 缺失时不带该字段（个别网关允许按账号默认模型兜底），
   -- 绝大多数接口要求必填——由 fromEnv 提前校验，正常路径不会缺
   if protocol == "responses" then
@@ -119,6 +127,12 @@ local function parseResponse(out, protocol)
   if data.error then
     local e = data.error
     return { ok = false, err = tostring(type(e) == "table" and (e.message or e.code) or e) }
+  end
+
+  if (protocol or DEFAULT_PROTOCOL) == "jev" then
+    -- System One 的结构化决策：整包 JSON 原样放回 text，answers 的解构
+    -- 与合法性校验在 jev.lua（那里才知道 questions 的语义）
+    return { ok = true, text = out, usage = data.usage }
   end
 
   if (protocol or DEFAULT_PROTOCOL) == "responses" then
@@ -461,6 +475,7 @@ Transport.parseResponse = parseResponse
 -- 按 URL 猜协议。显式配置优先。
 function Transport.guessProtocol(url)
   if type(url) ~= "string" then return DEFAULT_PROTOCOL end
+  if url:find("/systemone", 1, true) then return "jev" end
   if url:find("/responses", 1, true) then return "responses" end
   return "chat"
 end

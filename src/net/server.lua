@@ -56,6 +56,18 @@ local function buildAIAgent()
     -- 但测试/嵌入场景可能没有 love，给一条能走通的路。
     local T = require "src.core.ai.transport"
     local mode = os.getenv("SGS_AI_TRANSPORT") or "curl"
+    if os.getenv("SGS_AI_ENGINE") == "jev" then
+      local jkey = os.getenv("SGS_JEV_KEY")
+      if jkey and jkey ~= "" then
+        transport = T.curl {
+          url = os.getenv("SGS_JEV_URL") or "https://api.typesafe.ai/v1/systemone",
+          api_key = jkey,
+          model = os.getenv("SGS_JEV_MODEL") or "jev-latest",
+          protocol = "jev", timeout = 15,
+        }
+        err = nil
+        end
+    else
     local url = os.getenv("SGS_AI_URL")
     local key = os.getenv("SGS_AI_KEY") or os.getenv("OPENAI_API_KEY")
     local model = os.getenv("SGS_AI_MODEL")
@@ -77,6 +89,7 @@ local function buildAIAgent()
       }
       err = nil
     end
+    end -- else（非 jev 引擎）
     if transport then
       print("[服务端] 注意：AI 走同步传输层，每次请求会阻塞服务端几秒")
     end
@@ -84,11 +97,15 @@ local function buildAIAgent()
   if not transport then
     print(string.format("[服务端] SGS_NET_AI 已开但 AI 不可用：%s", tostring(err)))
     print("            需配置 SGS_AI_MODEL + SGS_AI_URL + SGS_AI_KEY，或 SGS_AI_TRANSPORT=proxy + ./tools/ai_proxy.py")
+    print("            或 SGS_AI_ENGINE=jev + SGS_JEV_KEY（TypeSafe System One）")
     return nil, nil
   end
 
   local agent = Agent.create({
     transport = transport,
+    -- 决策引擎跟随环境：SGS_AI_ENGINE=jev 时空座由 System One 决策
+    engine = (os.getenv("SGS_AI_ENGINE") == "jev") and "jev" or "llm",
+    jev_min_confidence = tonumber(os.getenv("SGS_JEV_MIN_CONFIDENCE") or "") or nil,
     -- love 下用高精度时钟，否则退回 os.time（秒级，超时判断会粗一点）
     clock = (love and love.timer and love.timer.getTime) or nil,
     on_error = function(reason)

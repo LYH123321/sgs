@@ -195,12 +195,18 @@ local function resolveProtocol(url)
 end
 
 -- 环境变量配置：
+--   SGS_AI_ENGINE=jev               切换到 TypeSafe System One 决策模型
+--                                    （需 SGS_JEV_KEY；默认 llm 走下面的链路）
 --   SGS_AI_TRANSPORT=proxy（推荐）  连本机代理 tools/ai_proxy.py，密钥不进游戏
 --   SGS_AI_TRANSPORT=curl（默认）   直连 HTTPS，需要 SGS_AI_URL + SGS_AI_KEY
 --   SGS_AI_PROTOCOL=chat|responses  接口形态（默认按 URL 猜，猜不出按 responses）
 --   SGS_AI_REASONING=none|low|...   Responses 的思维链强度。
 --                                   **默认 none**：hy3 开着思维链单次要 10 秒以上，
 --                                   关掉后 1.5 秒。这是能不能玩下去的关键开关。
+-- Jev 引擎专属（SGS_AI_ENGINE=jev 时生效，其他 SGS_AI_* 全部忽略）：
+--   SGS_JEV_KEY   必填（console.typesafe.ai/keys）
+--   SGS_JEV_URL   默认 https://api.typesafe.ai/v1/systemone
+--   SGS_JEV_MODEL 默认 jev-latest
 -- 没配就返回 nil + 原因，让上层决定是降级还是提示用户
 -- opts.reasoning 可覆盖 SGS_AI_REASONING（菜单「AI 思考」开关传入；
 -- 思维链开启时单次请求可达 12 秒以上，超时同步放宽到 150 秒）
@@ -208,6 +214,21 @@ end
 local function fromEnv(opts)
   opts = opts or {}
   local env = opts.env or os.getenv
+  local engine = env("SGS_AI_ENGINE")
+  if engine == "jev" then
+    local key = env("SGS_JEV_KEY")
+    if not key or key == "" then
+      return nil, "SGS_AI_ENGINE=jev 需要设置 SGS_JEV_KEY（console.typesafe.ai/keys 获取）"
+    end
+    return Threaded.create({
+      mode = "curl",
+      url = env("SGS_JEV_URL") or "https://api.typesafe.ai/v1/systemone",
+      protocol = "jev",
+      model = env("SGS_JEV_MODEL") or "jev-latest",
+      api_key = key,
+      timeout = 15,   -- 官方标称 70~500ms，留足余量
+    }), nil
+  end
   local model = env("SGS_AI_MODEL")
   local mode = env("SGS_AI_TRANSPORT") or "curl"
   local effort = opts.reasoning or env("SGS_AI_REASONING") or "none"

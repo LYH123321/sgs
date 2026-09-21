@@ -18,6 +18,7 @@ local Prompt = require "src.core.ai.prompt"
 local Parse = require "src.core.ai.parse"
 local Agent = require "src.core.ai.agent"
 local Transport = require "src.core.ai.transport"
+local Json = require "src.core.json"
 
 local failures, passes = 0, 0
 local function check(cond, msg)
@@ -1067,6 +1068,283 @@ do -- 请求摘要的牌名要中文化：thinkingLabel「正在思考：需要�
   check(brief2.ask == "需要打出【桃】", "peach 也应显示为【桃】")
   local brief3 = View.requestBrief({ type = "askForCard" })
   check(brief3.ask == "需要打出【?】", "缺牌名时安全兜底")
+end
+
+print()
+print("--- Jev 决策引擎（System One）---")
+local Jev = require "src.core.ai.jev"
+
+do -- build：单选请求 → 一个 choice 问题 + 身份推测并行问题
+  local hold = Agent.create({ transport = Transport.mock {
+    responder = function() return '{"action":1}' end } })
+  local room, ps = makeRoom(21, { 1 })
+  local req = advanceToRequest(room, hold, "askForUseCard")
+  check(req ~= nil, "jev: 应推进到出牌请求")
+  if req then
+    local actions = Actions.enumerate(req, room)
+    local prompt = Jev.build(room, req, actions, {})
+    check(type(prompt.state) == "string" and #prompt.state > 50,
+      "jev: state 应是实质文本（" .. tostring(#prompt.state) .. " 字节）")
+    check(prompt.state:find("身份局", 1, true) ~= nil,
+      "jev: state 应含规则前缀（无 system 消息，规则并入 state）")
+    local q = prompt.questions["action"]
+    check(q ~= nil and q.type == "choice", "jev: 出牌应构造 choice 问题")
+    local n_crit = 0
+    local has_pass_key = false
+    for k, _ in pairs(q.criteria or {}) do
+      n_crit = n_crit + 1
+      if k:match("^a%d+$") then has_pass_key = true end
+    end
+    check(n_crit == #actions, string.format(
+      "jev: criteria 数应等于候选数（%d vs %d）", n_crit, #actions))
+    check(has_pass_key, "jev: criteria 键应为 a<编号>")
+    local belief_n = 0
+    for k, _ in pairs(prompt.questions) do
+      if k:match("^belief%d+$") then belief_n = belief_n + 1 end
+    end
+    check(belief_n >= 1, "jev: 未亮身份的座位应有并行身份推测问题")
+  end
+end
+
+do -- build：弃牌 → 每张牌一个 score + any 模式的 stop noul
+  local hold = Agent.create({ transport = Transport.mock {
+    responder = function() return '{"action":1}' end } })
+  local room, ps = makeRoom(22, { 1 })
+  local req = advanceToRequest(room, hold, "askForUseCard")
+  check(req ~= nil, "jev: 弃牌前置推进应成功")
+  if req then
+    -- 手工构造弃牌请求：手牌 4 张弃 2
+    local p = req.player
+    local cards = {}
+    for i = 1, math.min(4, #p.hand) do cards[i] = p.hand[i] end
+    local dreq = { type = "askForDiscard", player = p, n = 2, cards = cards }
+    local actions = Actions.enumerate(dreq, room)
+    local prompt = Jev.build(room, dreq, actions, {})
+    local keep_n, others = 0, 0
+    for k, q in pairs(prompt.questions) do
+      if k:match("^keep%d+$") then
+        keep_n = keep_n + 1
+        check(q.type == "score" and #q.criteria == 3,
+          "jev: 弃牌问题应为三档 score")
+      elseif not k:match("^belief%d+$") then
+        others = others + 1
+      end
+    end
+    check(keep_n == #actions, "jev: 每张牌一个 keep 问题")
+    check(others == 0, "jev: 普通（非 any）弃牌不应有 stop 问题")
+    -- any 模式（制衡）
+    local areq = { type = "askForDiscard", player = p, n = 2, cards = cards, any = true }
+    local a_actions = Actions.enumerate(areq, room)
+    local a_prompt = Jev.build(room, areq, a_actions, {})
+    check(a_prompt.questions["stop"] ~= nil
+      and a_prompt.questions["stop"].type == "noul",
+      "jev: any 模式弃牌应有 stop noul")
+  end
+end
+
+do -- map：choice 高置信 → 直接执行；低置信 → 次高或保守 pass
+  local hold = Agent.create({ transport = Transport.mock {
+    responder = function() return '{"action":1}' end } })
+  local room, ps = makeRoom(23, { 1 })
+  local req = advanceToRequest(room, hold, "askForUseCard")
+  check(req ~= nil, "jev: map 前置推进应成功")
+  if req then
+    local actions = Actions.enumerate(req, room)
+    local prompt = Jev.build(room, req, actions, {})
+    local ctx = prompt.jev_ctx
+    -- 找一个 use 动作和一个 pass 动作
+    local use_id, pass_id
+    for _, a in ipairs(actions) do
+      if a.kind == "use" and not use_id then use_id = a.id end
+      if a.kind == "pass" then pass_id = a.id end
+    end
+    check(use_id ~= nil and pass_id ~= nil, "jev: 应同时有 use 与 pass 候选")
+    local function ansFor(id, conf, p_top, p_second)
+      return {
+        action = { type = "choice", choice = "a" .. id,
+          confidence = conf,
+          probabilities = { ["a" .. id] = p_top, ["a" .. pass_id] = p_second } },
+      }
+    end
+    -- 高置信：执行最高概率
+    local resp, err = Jev.map(ansFor(use_id, 0.9, 0.9, 0.1), req, room, actions, ctx)
+    check(resp ~= nil and resp.card ~= nil and err == nil,
+      "jev: 高置信 choice 应映射为出牌响应")
+    -- 低置信 + 次高（pass）达标：保守选 pass
+    local resp2, err2 = Jev.map(ansFor(use_id, 0.2, 0.2, 0.5), req, room, actions, ctx)
+    check(resp2 == nil and err2 == nil,
+      "jev: 低置信且次高是 pass 时应保守放弃（resp=" .. tostring(resp2) .. "）")
+    -- 低置信 + 无候选达标且有 pass：走 pass
+    local resp3 = Jev.map({ action = { type = "choice", choice = "a" .. use_id,
+      confidence = 0.1, probabilities = { ["a" .. use_id] = 0.4,
+        ["a" .. pass_id] = 0.3 } } }, req, room, actions, ctx)
+    check(resp3 == nil, "jev: 全不达标且有 pass 应保守放弃")
+    -- 概率指向不存在的动作：拒绝
+    local resp4, err4 = Jev.map({ action = { type = "choice", choice = "a999",
+      confidence = 0.9, probabilities = { a999 = 1.0 } } }, req, room, actions, ctx)
+    check(resp4 == nil and err4 ~= nil, "jev: 越界答案应拒绝走机械兜底")
+  end
+end
+
+do -- map：score 弃牌按保留期望升序取前 n
+  local hold = Agent.create({ transport = Transport.mock {
+    responder = function() return '{"action":1}' end } })
+  local room, ps = makeRoom(24, { 1 })
+  local req = advanceToRequest(room, hold, "askForUseCard")
+  check(req ~= nil, "jev: score 弃牌前置推进应成功")
+  if req then
+    local p = req.player
+    local cards = {}
+    for i = 1, math.min(3, #p.hand) do cards[i] = p.hand[i] end
+    local dreq = { type = "askForDiscard", player = p, n = 1, cards = cards }
+    local actions = Actions.enumerate(dreq, room)
+    local prompt = Jev.build(room, dreq, actions, {})
+    local ctx = prompt.jev_ctx
+    -- 期望分：第一张 0（必弃）、第二张 1（必留）
+    local answers = {}
+    answers["keep" .. actions[1].id] = { type = "score", score = 0,
+      probabilities = { ["0"] = 1.0, ["1"] = 0.0, ["2"] = 0.0 } }
+    answers["keep" .. actions[2].id] = { type = "score", score = 2,
+      probabilities = { ["0"] = 0.0, ["1"] = 0.0, ["2"] = 1.0 } }
+    if actions[3] then
+      answers["keep" .. actions[3].id] = { type = "score", score = 1,
+        probabilities = { ["0"] = 0.0, ["1"] = 1.0, ["2"] = 0.0 } }
+    end
+    local resp, err = Jev.map(answers, dreq, room, actions, ctx)
+    check(resp ~= nil and #resp == 1 and resp[1] == actions[1].card,
+      "jev: 弃牌应取保留期望最低的一张")
+    check(err == nil, "jev: 弃牌映射不应报错（" .. tostring(err) .. "）")
+    -- any 模式 stop 高于阈值 → 不弃
+    local areq = { type = "askForDiscard", player = p, n = 1, cards = cards, any = true }
+    local a_actions = Actions.enumerate(areq, room)
+    local a_prompt = Jev.build(room, areq, a_actions, {})
+    local a_answers = { stop = { type = "noul", noul = 0.9 } }
+    for _, a in ipairs(a_actions) do
+      if a.kind == "discard" then
+        a_answers["keep" .. a.id] = { type = "score",
+          probabilities = { ["2"] = 1.0 } }
+      end
+    end
+    local aresp, aerr = Jev.map(a_answers, areq, room, a_actions, a_prompt.jev_ctx)
+    check(aresp ~= nil and #aresp == 0 and aerr == nil,
+      "jev: any 弃牌 stop 达标应选不弃（空表）")
+  end
+end
+
+do -- map：技能发动 noul 阈值 + 身份推测矛盾调和
+  local hold = Agent.create({ transport = Transport.mock {
+    responder = function() return '{"action":1}' end } })
+  local room, ps = makeRoom(25, { 1 })
+  local req = advanceToRequest(room, hold, "askForUseCard")
+  check(req ~= nil, "jev: noul 前置推进应成功")
+  if req then
+    -- 技能发动
+    local sreq = { type = "askForSkillInvoke", player = req.player, skill = "测试技" }
+    local s_actions = Actions.enumerate(sreq, room)
+    local s_prompt = Jev.build(room, sreq, s_actions, {})
+    local yes, yerr = Jev.map({ invoke = { type = "noul", noul = 0.8 } },
+      sreq, room, s_actions, s_prompt.jev_ctx)
+    check(yes == true and yerr == nil, "jev: noul≥0.5 应发动技能")
+    local no = Jev.map({ invoke = { type = "noul", noul = 0.3 } },
+      sreq, room, s_actions, s_prompt.jev_ctx)
+    check(no == false, "jev: noul<0.5 应不发动")
+  end
+  -- 身份调和：两个座位都判主公 → 只留概率高的
+  local targets = {
+    { seat = 2, name = "P2" }, { seat = 3, name = "P3" },
+  }
+  local picks = Jev.reconcileBeliefs({
+    belief2 = { probabilities = { 主公 = 0.9, 反贼 = 0.1 } },
+    belief3 = { probabilities = { 主公 = 0.6, 忠臣 = 0.4 } },
+  }, targets)
+  check(picks[2] ~= nil and picks[2].label == "主公",
+    "jev: 高概率主公判断应保留")
+  check(picks[3] == nil, "jev: 矛盾的低概率主公应被调和掉")
+end
+
+do -- Agent 全链路：engine=jev + mock 传输（text 放整个 JSON）
+  local room, ps = makeRoom(26, { 1 })
+  -- 构造 jev 响应：选候选里的第一个 use（或 pass）
+  local function jevResponder(prompt)
+    local use_id
+    local acts = prompt.actions
+    if acts then
+      for _, a in ipairs(acts) do
+        if a.kind == "use" then use_id = a.id break end
+      end
+    end
+    if not use_id then
+      for _, a in ipairs(acts or {}) do
+        if a.kind == "pass" then use_id = a.id break end
+      end
+    end
+    local body = { answers = {
+      action = { type = "choice", choice = "a" .. use_id, confidence = 0.9,
+        probabilities = { ["a" .. use_id] = 0.9 } },
+    } }
+    return Json.encode(body)
+  end
+  local agent = Agent.create({
+    engine = "jev",
+    transport = Transport.mock { responder = jevResponder },
+  })
+  local req = advanceToRequest(room, agent, "askForUseCard")
+  check(req ~= nil, "jev: agent 链路应推进到出牌请求")
+  if req then
+    local resp, state = agent:respond(req, room)
+    local n = 0
+    while state == "thinking" and n < 10 do
+      resp, state = agent:respond(req, room)
+      n = n + 1
+    end
+    check(state == "ready", "jev: agent 应返回 ready（" .. state .. "）")
+    check(resp == nil or type(resp) == "table",
+      "jev: agent 响应形态合法（出牌表或 nil）")
+    check(agent.stats.by_ai >= 1, "jev: 决策应计入 by_ai")
+  end
+end
+
+do -- engine 默认 llm：jev 模块不参与，原行为不变
+  local room, ps = makeRoom(27, { 1 })
+  local agent = Agent.create({
+    transport = Transport.mock { responder = function() return '{"action":1}' end },
+  })
+  check(agent.engine == "llm", "jev: 默认引擎应为 llm")
+  local req = advanceToRequest(room, agent, nil)
+  check(req ~= nil, "jev: llm 链路推进正常")
+  if req then
+    local resp, state = agent:respond(req, room)
+    local n = 0
+    while state == "thinking" and n < 10 do
+      resp, state = agent:respond(req, room)
+      n = n + 1
+    end
+    check(state == "ready", "jev: llm 路径应不受影响")
+  end
+end
+
+do -- transport：jev 协议请求体与响应解析
+  local T = require "src.core.ai.transport"
+  local body = T.buildBody({ protocol = "jev", model = "jev-latest" },
+    { state = "局面", questions = { q1 = { type = "noul", instructions = "是否" } } })
+  local decoded = Json.decode(body)
+  check(decoded.state == "局面" and decoded.model == "jev-latest"
+    and decoded.questions.q1.type == "noul",
+    "jev: 请求体应是 state/questions 结构（无 messages）")
+  check(decoded.messages == nil and decoded.temperature == nil,
+    "jev: 请求体不应携带对话协议字段")
+  local parsed = T.parseResponse(
+    Json.encode({ answers = { q1 = { type = "noul", noul = 1.0 } } }), "jev")
+  check(parsed.ok and parsed.text ~= nil,
+    "jev: 响应解析应整包放回 text 供 answersFrom 解构")
+  local answers, aerr = Jev.answersFrom(parsed.text)
+  check(answers ~= nil and answers.q1.noul == 1.0,
+    "jev: answersFrom 应解出 answers（" .. tostring(aerr) .. "）")
+  local bad, berr = Jev.answersFrom('{"error":{"message":"key invalid"}}')
+  check(bad == nil and tostring(berr):find("key invalid", 1, true) ~= nil,
+    "jev: 接口错误应转成中文提示错误")
+  check(T.guessProtocol("https://api.typesafe.ai/v1/systemone") == "jev",
+    "jev: URL 特征应识别为 jev 协议")
 end
 
 print(string.format("\n===== AI 测试: %d passed, %d failed =====", passes, failures))
