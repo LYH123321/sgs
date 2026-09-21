@@ -136,6 +136,98 @@ soak("8 人身份局", function(seed) return makeIdentity(seed, 8) end)
 soak("5 人随机武将身份局", function(seed) return makeRandomIdentity(seed, 5) end)
 soak("8 人随机武将身份局", function(seed) return makeRandomIdentity(seed, 8) end)
 
+-- Jev 决策引擎压测（mock 传输，不联网）：验证 questions 构造、
+-- answers 映射（含两段式/复核/门控路径）在对局里产出的动作始终合法，
+-- 且对局可完结、卡牌守恒。用确定性 responder 模拟 Jev 行为。
+print("\n-- Jev 引擎（mock）：" .. N .. " 局 --")
+local Agent = require "src.core.ai.agent"
+local AiTransport = require "src.core.ai.transport"
+local AiJson = require "src.core.json"
+local Jev = require "src.core.ai.jev"
+local AiActions = require "src.core.ai.actions"
+do
+  local bad = {}
+  for seed = 1, N do
+    local ok, err = pcall(function()
+      local room = makeIdentity(seed, 5)
+      -- 座位 1/3 交给 jev Agent（Driver 才会走 ai 分支）
+      for _, seat in ipairs({ 1, 3 }) do
+        room.players[seat]:setControl("ai")
+      end
+      room:start() -- makeIdentity 构造器不自启（runGame 才负责 start）
+      -- 模拟 Jev：choice 给最高置信的首个候选；弃牌给中档 score；
+      -- 技能给 noul 0.5 以下（保守）；复核恒通过
+      local agent = Agent.create({
+        engine = "jev",
+        transport = AiTransport.mock { responder = function(prompt)
+          local ctx = prompt.jev_ctx
+          local answers = {}
+          if ctx.single then
+            local use_id
+            for _, a in ipairs(prompt.actions or {}) do
+              if a.kind == "use" then use_id = a.id break end
+            end
+            if not use_id then
+              for _, a in ipairs(prompt.actions or {}) do
+                if a.kind == "pass" then use_id = a.id break end
+              end
+            end
+            if not use_id then use_id = (prompt.actions or {})[1].id end
+            answers.action = { type = "choice", choice = "a" .. use_id,
+              confidence = 0.9, probabilities = { ["a" .. use_id] = 0.9 } }
+            answers.confirm = { type = "noul", noul = 0.9 }
+            for _, a in ipairs(prompt.actions or {}) do
+              if a.kind == "use" then
+                answers["gain" .. a.id] = { type = "score",
+                  probabilities = { ["1"] = 1.0 } }
+              end
+            end
+          elseif ctx.discard then
+            for _, id in ipairs(ctx.discard_order or {}) do
+              answers["keep" .. id] = { type = "score",
+                probabilities = { ["1"] = 1.0 } }
+            end
+            if prompt.questions["stop"] then
+              answers["stop"] = { type = "noul", noul = 0.2 }
+            end
+          elseif ctx.invoke then
+            answers.invoke = { type = "noul", noul = 0.4 }
+          end
+          return AiJson.encode({ answers = answers })
+        end },
+      })
+      local driver = Driver.create(room, Bot.make(), agent)
+      local guard = 0
+      while not room.game_over and guard < 200000 do
+        guard = guard + 1
+        local state, req = driver:advance()
+        if state == "over" then break end
+        if state == "thinking" then
+          local resp, st = agent:respond(req, room)
+          local n = 0
+          while st == "thinking" and n < 10 do
+            resp, st = agent:respond(req, room)
+            n = n + 1
+          end
+          if st == "ready" then room:step(resp) end
+        elseif state == "human" then
+          room:step(Bot.make()(req, room))
+        end
+      end
+      assert(room.game_over, "对局未结束")
+      assert(room.turn_count <= Room.MAX_TURNS, "超过最大回合数")
+      assert(totalCards(room) == Standard.deckSize(),
+        "卡牌不守恒 " .. totalCards(room) .. " != " .. Standard.deckSize())
+      assert(agent.stats.mechanical < agent.stats.by_ai,
+        "机械兜底不应超过 jev 决策数（" .. agent.stats.mechanical
+        .. " vs " .. agent.stats.by_ai .. "）")
+    end)
+    if not ok then bad[#bad + 1] = seed .. ":" .. tostring(err) end
+  end
+  check(#bad == 0, "jev 引擎(mock) " .. N .. " 局全部通过"
+    .. (#bad == 0 and "" or "（失败: " .. table.concat(bad, " | ") .. "）"))
+end
+
 print("\n-- 逐将覆盖：每名武将各跑 3 局 --")
 
 local Generals = require "src.core.generals"

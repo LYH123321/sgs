@@ -173,9 +173,15 @@ Jev 每个问题独立求值，可能给出「座位 2 是主公、座位 3 也�
 ## 八、实施阶段
 
 1. **一期（核心）✅**：`src/core/ai/jev.lua`（build/map/answersFrom/调和/门控）+ transport `jev` 协议分支 + Agent `engine` 分流 + `SGS_AI_ENGINE` 开关 + 43 项单测（AI 测试 154→197）。
-2. **二期（接线）✅**：`scene_room`/`server` 按 `SGS_AI_ENGINE` 创建 jev Agent（超时 20s、置信度可配）；`tools/ai-check.lua` 支持 jev 自检；`ai.env.example` 增补 Jev 配置段。推测面板概率展示未做（见四期），当前 jev 模式的推测展示沿用 beliefs 时间线（`on_beliefs` 回调已透传）。
+2. **二期（接线）✅**：`scene_room`/`server` 按 `SGS_AI_ENGINE` 创建 jev Agent（超时 20s、置信度可配）；`tools/ai-check.lua` 支持 jev 自检；`ai.env.example` 增补 Jev 配置段。
 3. **三期（联机）✅**：`net/server.lua` 线程版走 `ui/ai_transport.fromEnv`（自动识别 jev）；无 love 兜底路径支持 `SGS_JEV_*` 直连。
-4. **四期（可选，未实施）**：UI 概率分布展示（`on_probs`）、代理透传、混合模式（Jev 管高频响应 + LLM 管身份长推理）、两段式复核、压测对比报告。
+4. **四期 ✅（2026-09-21）**：
+   - **概率展示**：`extra.probs`（top3 动作概率）/`belief_probs`（座位身份概率）随 map 返回，Agent `on_probs` 回调 → scene_room 推测面板「抉择/猜测」信息流（kind=prob）。
+   - **代理透传**：`ai_proxy.py` 新增 `/v1/systemone` 路径，密钥 `SGS_JEV_KEY` 配代理侧；游戏侧 `SGS_AI_ENGINE=jev` + `SGS_AI_TRANSPORT=proxy` 即可，密钥不进游戏进程。
+   - **混合模式**：`SGS_AI_ENGINE=mixed`——Agent 双传输层（`transport` llm + `transport_jev`），响应牌/技能征询/弃牌/选牌/拆牌/选择走 jev，出牌/观星走 llm；`fromEnvMixed()` 组装，单侧不可用自动回落。
+   - **两段式复核**：候选 >200 时 choice criteria 按牌名去重裁剪，全部 use 候选并行 gain score（同一次调用）；映射时 score 全票（≥0.9）可改判。单选请求恒附 `confirm` noul 复核，高风险主动使用被否定时保守 pass。
+   - **压测**：`test_soak.lua` 新增 jev(mock) 组（25 局），断言决策合法性、对局完结、卡牌守恒与兜底占比。
+   - 单测 197→221（新增 24 项四期用例）。
 
 ## 九、风险与边界
 

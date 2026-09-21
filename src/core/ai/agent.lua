@@ -61,7 +61,11 @@ function Agent:init(opts)
   self.transport = opts.transport
   -- 决策引擎："llm"（对话模型，Prompt+Parse 文本路线，默认）
   --           "jev"（TypeSafe System One 决策模型，state+questions 路线）
-  self.engine = opts.engine == "jev" and "jev" or "llm"
+  --           "mixed"（混合：高频短决策走 jev，出牌/观星等长推理走 llm）
+  self.engine = (opts.engine == "jev" or opts.engine == "mixed")
+    and opts.engine or "llm"
+  -- mixed 模式的第二传输层（jev 用）；按请求类型路由到 engineFor
+  self.transport_jev = opts.transport_jev
   -- jev 引擎的置信度门限（choice 低于它走次高概率/机械兜底）
   self.jev_min_confidence = opts.jev_min_confidence or Jev.DEFAULT_MIN_CONFIDENCE
   -- 全部请求都交给 LLM。设 false 可退回「只问决策类请求」的省流模式。
@@ -79,8 +83,12 @@ function Agent:init(opts)
   -- on_beliefs(changes, ctx)：身份判断发生变化时回调（UI 展示猜测过程用）。
   --   changes = { {name=, from=, to=} }，ctx = {player=, reason=, turn=}
   -- on_reasoning(player_name, summary)：模型返回思维链摘要时回调（思考开启时才有）
+  -- on_probs(player_name, dist)：jev 引擎的概率分布回调。
+  --   dist = {probs={ {desc=,p=} top3 }, belief_probs={name→{身份→p}},
+  --           confidence=choice 置信度}
   self.on_beliefs = opts.on_beliefs
   self.on_reasoning = opts.on_reasoning
+  self.on_probs = opts.on_probs
   -- thinkingLabel 里玩家名的显示形式（UI 注入，如 "AI（张飞）"）；未注入用原名
   self.name_of = opts.name_of
   self.current = nil
@@ -115,6 +123,36 @@ function Agent:respond(req, room)
   return self:_mechanical(req, room, "内部异常：" .. tostring(resp)), "ready"
 end
 
+-- mixed 模式的路由表：这些请求类型走 jev（快、便宜、单次判定），
+-- 其余（出牌 askForUseCard / 观星 askForGuanxing 这类长推理）走 llm。
+-- 响应牌/技能征询/弃牌/选牌是「几秒内可判断」的原子决策，正是
+-- System One 的设计场景；身份推测也只在 llm 路径的输出里产生。
+local MIXED_JEV_TYPES = {
+  askForCard = true,
+  askForSkillInvoke = true,
+  askForDiscard = true,
+  askForChooseCard = true,
+  askForDiscardFrom = true,
+  askForChoice = true,
+}
+
+-- 本次请求实际使用的引擎（mixed 按类型路由，其他引擎恒定）
+function Agent:_engineFor(req)
+  if self.engine ~= "mixed" then return self.engine end
+  if MIXED_JEV_TYPES[req.type] and self.transport_jev then
+    return "jev"
+  end
+  return "llm"
+end
+
+-- 本次请求实际使用的传输层（与 _engineFor 对应）
+function Agent:_transportFor(req)
+  if self:_engineFor(req) == "jev" then
+    return self.transport_jev or self.transport
+  end
+  return self.transport
+end
+
 function Agent:_respond(req, room)
   if not self.transport then
     return self:_mechanical(req, room, "未配置传输层"), "ready"
@@ -130,8 +168,8 @@ function Agent:_respond(req, room)
   return self:_poll(req, room)
 end
 
-function Agent:_buildPrompt(req, room, actions, memory, hint)
-  if self.engine == "jev" then
+function Agent:_buildPrompt(req, room, actions, memory, hint, engine)
+  if engine == "jev" then
     -- Jev 无文本生成，重试没有意义（同样的问题大概率同样的答案），
     -- hint 只进 state 供参考
     return Jev.build(room, req, actions, {
@@ -155,14 +193,17 @@ function Agent:_start(req, room, hint)
     return self:_mechanical(req, room, "没有可行动作"), "ready"
   end
   local memory = self:memoryFor(req.player)
-  local prompt = self:_buildPrompt(req, room, actions, memory, hint)
+  local engine = self:_engineFor(req)
+  local transport = self:_transportFor(req)
+  local prompt = self:_buildPrompt(req, room, actions, memory, hint, engine)
   self.stats.asked = self.stats.asked + 1
-  if not self.transport:submit(prompt) then
+  if not transport:submit(prompt) then
     return self:_retryOrMechanical(req, room, "提交请求失败")
   end
   self.current = {
     req = req, actions = actions, prompt = prompt,
     memory = memory, attempt = 1, started = self.clock(),
+    engine = engine, transport = transport,
   }
   return nil, "thinking"
 end
@@ -170,22 +211,24 @@ end
 function Agent:_poll(req, room)
   local cur = self.current
   if not cur then return self:_mechanical(req, room, "状态丢失"), "ready" end
+  local transport = cur.transport or self.transport
 
   if self.clock() - cur.started > self.timeout then
     self.stats.timeouts = self.stats.timeouts + 1
-    if self.transport.cancel then self.transport:cancel() end
+    if transport.cancel then transport:cancel() end
     return self:_retryOrMechanical(req, room,
       string.format("超过 %d 秒未返回", self.timeout))
   end
 
-  local res = self.transport:poll()
+  local res = transport:poll()
   if not res then return nil, "thinking" end
   if not res.ok then
     return self:_retryOrMechanical(req, room, res.err or "调用失败")
   end
 
   local resp, err, extra
-  if self.engine == "jev" then
+  local used_engine = cur.engine or self.engine
+  if used_engine == "jev" then
     local answers, aerr = Jev.answersFrom(res.text)
     if not answers then
       err = aerr
@@ -221,6 +264,15 @@ function Agent:_poll(req, room)
   self:_remember(req, room, cur, resp, extra)
   if res.reasoning and self.on_reasoning then
     pcall(self.on_reasoning, req.player.name, res.reasoning)
+  end
+  -- jev 引擎：结构化概率分布 → UI 推测面板（替代 LLM 的思维链文本）
+  if used_engine == "jev" and self.on_probs and extra then
+    if extra.probs or extra.belief_probs then
+      pcall(self.on_probs, req.player.name, {
+        probs = extra.probs, belief_probs = extra.belief_probs,
+        confidence = extra.confidence,
+      })
+    end
   end
   if self.on_decision then
     pcall(self.on_decision, {
@@ -269,8 +321,10 @@ function Agent:_retryOrMechanical(req, room, reason)
     self.stats.retried = self.stats.retried + 1
     local prompt = self:_buildPrompt(req, room, cur.actions, cur.memory,
       string.format("你上一次的输出无法使用（%s）。请只输出符合格式的一行 JSON，"
-        .. "action 必须是后面列出的编号之一。", tostring(reason)))
-    if self.transport:submit(prompt) then
+        .. "action 必须是后面列出的编号之一。", tostring(reason)),
+      cur.engine or self.engine)
+    local transport = cur.transport or self.transport
+    if transport:submit(prompt) then
       cur.prompt = prompt
       cur.started = self.clock()
       return nil, "thinking"

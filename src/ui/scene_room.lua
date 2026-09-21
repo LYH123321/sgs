@@ -280,12 +280,34 @@ function RoomScene:beginPlay()
   -- 思维链开启时单次调用 12 秒以上，Agent 自身的超时也要放宽（默认 30 秒）
   local thinking_on = self.ai_reasoning and self.ai_reasoning ~= "none"
     and self.ai_reasoning ~= ""
-  -- 决策引擎跟随传输层配置：SGS_AI_ENGINE=jev 时 Agent 走 Jev 路线
-  local engine = (os.getenv("SGS_AI_ENGINE") == "jev") and "jev" or "llm"
+  -- 决策引擎跟随传输层配置：SGS_AI_ENGINE=jev 全走 System One；
+  -- mixed 高频短决策走 jev、出牌/观星等长推理走 llm
+  local engine = os.getenv("SGS_AI_ENGINE")
+  if engine ~= "jev" and engine ~= "mixed" then engine = "llm" end
   local jev_conf = tonumber(os.getenv("SGS_JEV_MIN_CONFIDENCE") or "") or nil
+  local transport_jev = nil
+  if engine == "mixed" then
+    -- 混合模式：再建一个 jev 传输层（llm 用上面的 transport）
+    if transport then
+      local ok2, mod2 = pcall(require, "src.ui.ai_transport")
+      if ok2 then
+        local _, jt, jerr = mod2.fromEnvMixed()
+        if jt then
+          transport_jev = jt
+          if jerr then print("[AI/mixed] " .. jerr) end
+        else
+          print("[AI/mixed] jev 不可用，全部走 llm：" .. tostring(jerr))
+          engine = "llm"
+        end
+      end
+    else
+      engine = "llm" -- llm 都没配上，mixed 无意义
+    end
+  end
   self.agent = Agent.create({
     transport = transport,
     engine = engine,
+    transport_jev = transport_jev,
     jev_min_confidence = jev_conf,
     timeout = engine == "jev" and 20 or (thinking_on and 140 or nil),
     -- 「正在思考」提示里的名字与面板同款（AI（武将）/BOT（武将））
@@ -311,6 +333,34 @@ function RoomScene:beginPlay()
       if summary and summary ~= "" then
         local s = tostring(summary):gsub("%s+", " ")
         self:pushAIFeed("think", string.format("%s 思考：%s", who, TextFit.truncate(s, 60)))
+      end
+    end,
+    -- Jev 决策的概率分布（替代思维链文本）：top 动作概率 + 身份概率
+    on_probs = function(who, dist)
+      local parts = {}
+      for i, pr in ipairs(dist.probs or {}) do
+        parts[#parts + 1] = string.format("%s:%d%%",
+          TextFit.truncate(tostring(pr.desc), 14), math.floor((pr.p or 0) * 100 + 0.5))
+      end
+      if dist.confidence then
+        parts[#parts + 1] = string.format("置信%d%%",
+          math.floor((dist.confidence or 0) * 100 + 0.5))
+      end
+      if #parts > 0 then
+        self:pushAIFeed("prob",
+          string.format("%s 抉择：%s", who, table.concat(parts, " ")))
+      end
+      for name, bp in pairs(dist.belief_probs or {}) do
+        local top, top_p
+        for label, p in pairs(bp) do
+          if type(p) == "number" and (not top_p or p > top_p) then
+            top, top_p = label, p
+          end
+        end
+        if top and top_p and top_p > 0.55 then
+          self:pushAIFeed("prob", string.format("%s 猜 %s≈%s %d%%",
+            who, name, top, math.floor(top_p * 100 + 0.5)))
+        end
       end
     end,
   })

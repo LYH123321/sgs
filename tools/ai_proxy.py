@@ -79,33 +79,40 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 break
         if self.path in ("/v1/responses", "/v1/chat/completions"):
             return base + self.path
+        if self.path == "/v1/systemone":
+            # Jev 决策模型（TypeSafe System One）：代理只认识 SGS_JEV_URL
+            # 或官方默认端点；密钥用 SGS_JEV_KEY（不复用对话 LLM 的 key）
+            return self.jev_url
         return self.upstream
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length) if length else b""
 
-        if not self.upstream:
-            self._reject(500, "代理未配置 SGS_AI_URL")
-            return
-
+        is_jev = self.path == "/v1/systemone"
         upstream = self.upstream_for()
+        api_key = self.jev_key if is_jev else self.api_key
+        inject_model = self.jev_model if is_jev else self.inject_model
+
+        if not upstream:
+            self._reject(500, "代理未配置 %s" % ("SGS_JEV_URL" if is_jev else "SGS_AI_URL"))
+            return
 
         # 模型名代理侧注入：游戏进程（proxy 模式）可以不配 SGS_AI_MODEL，
         # 请求体不带 model 字段时在这里补上——与密钥同一哲学：
         # 接口配置只留在代理侧。游戏侧若显式带了 model 则原样放行。
-        if self.inject_model:
+        if inject_model:
             try:
                 data = json.loads(body)
                 if not data.get("model"):
-                    data["model"] = self.inject_model
+                    data["model"] = inject_model
                     body = json.dumps(data).encode()
             except (ValueError, AttributeError):
                 pass  # 非 JSON 请求体：原样转发，让上游去报错
 
         headers = {"Content-Type": "application/json", "Accept": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = "Bearer " + self.api_key
+        if api_key:
+            headers["Authorization"] = "Bearer " + api_key
 
         if self.verbose:
             log("[->] %s %d 字节" % (upstream, len(body)))
@@ -177,6 +184,15 @@ def main():
 
     ProxyHandler.upstream = upstream
     ProxyHandler.api_key = api_key
+    # Jev（TypeSafe System One）透传：/v1/systemone 走独立端点与密钥
+    ProxyHandler.jev_url = os.environ.get("SGS_JEV_URL",
+                                          "https://api.typesafe.ai/v1/systemone")
+    ProxyHandler.jev_key = os.environ.get("SGS_JEV_KEY", "")
+    ProxyHandler.jev_model = os.environ.get("SGS_JEV_MODEL", "jev-latest")
+    if ProxyHandler.jev_key:
+        log("Jev 透传已配置：%s" % ProxyHandler.jev_url)
+    else:
+        log("提示：未设置 SGS_JEV_KEY——游戏走 jev+proxy 时会因缺密钥失败。")
     # 代理侧模型名：请求体缺 model 时注入（游戏 proxy 模式可完全不配模型）
     ProxyHandler.inject_model = os.environ.get("SGS_AI_MODEL", "")
     if not ProxyHandler.inject_model:

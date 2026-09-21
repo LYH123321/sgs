@@ -101,10 +101,28 @@ local function buildAIAgent()
     return nil, nil
   end
 
+  -- 决策引擎跟随环境：jev 全走 System One；mixed 双传输层按类型路由
+  local engine = os.getenv("SGS_AI_ENGINE")
+  if engine ~= "jev" and engine ~= "mixed" then engine = "llm" end
+  local transport_jev = nil
+  if engine == "mixed" then
+    local ok_m, mod_m = pcall(require, "src.ui.ai_transport")
+    if ok_m then
+      local _, jt, jerr = mod_m.fromEnvMixed()
+      if jt then
+        transport_jev = jt
+        if jerr then print("[服务端][AI/mixed] " .. jerr) end
+      else
+        print("[服务端][AI/mixed] jev 不可用，全部走 llm：" .. tostring(jerr))
+        engine = "llm"
+      end
+    end
+  end
+
   local agent = Agent.create({
     transport = transport,
-    -- 决策引擎跟随环境：SGS_AI_ENGINE=jev 时空座由 System One 决策
-    engine = (os.getenv("SGS_AI_ENGINE") == "jev") and "jev" or "llm",
+    engine = engine,
+    transport_jev = transport_jev,
     jev_min_confidence = tonumber(os.getenv("SGS_JEV_MIN_CONFIDENCE") or "") or nil,
     -- love 下用高精度时钟，否则退回 os.time（秒级，超时判断会粗一点）
     clock = (love and love.timer and love.timer.getTime) or nil,

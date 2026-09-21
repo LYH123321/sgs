@@ -211,23 +211,44 @@ end
 -- opts.reasoning 可覆盖 SGS_AI_REASONING（菜单「AI 思考」开关传入；
 -- 思维链开启时单次请求可达 12 秒以上，超时同步放宽到 150 秒）
 -- opts.env 可注入环境读取函数（单测用），默认 os.getenv
+-- Jev 引擎的传输层构造（直连或代理透传）
+local function jevFromEnv(env)
+  local mode = env("SGS_AI_TRANSPORT") or "curl"
+  if mode == "proxy" then
+    -- Jev 走代理透传：密钥配在 ai_proxy.py 侧（SGS_JEV_KEY），
+    -- 游戏进程不需要密钥；/v1/systemone 由代理转发到官方端点
+    local base = env("SGS_AI_PROXY") or "http://127.0.0.1:8899"
+    return Threaded.create({
+      mode = "socket",
+      url = base .. "/v1/systemone",
+      protocol = "jev",
+      model = env("SGS_JEV_MODEL") or "jev-latest",
+      api_key = env("SGS_JEV_KEY") or "", -- 代理注入，可空
+      timeout = 15,
+    }), nil
+  end
+  local key = env("SGS_JEV_KEY")
+  if not key or key == "" then
+    return nil, "SGS_AI_ENGINE=jev/mixed 需要设置 SGS_JEV_KEY"
+      .. "（console.typesafe.ai/keys 获取；"
+      .. "或 SGS_AI_TRANSPORT=proxy 把密钥配在 ai_proxy.py 侧）"
+  end
+  return Threaded.create({
+    mode = "curl",
+    url = env("SGS_JEV_URL") or "https://api.typesafe.ai/v1/systemone",
+    protocol = "jev",
+    model = env("SGS_JEV_MODEL") or "jev-latest",
+    api_key = key,
+    timeout = 15,   -- 官方标称 70~500ms，留足余量
+  }), nil
+end
+
 local function fromEnv(opts)
   opts = opts or {}
   local env = opts.env or os.getenv
   local engine = env("SGS_AI_ENGINE")
-  if engine == "jev" then
-    local key = env("SGS_JEV_KEY")
-    if not key or key == "" then
-      return nil, "SGS_AI_ENGINE=jev 需要设置 SGS_JEV_KEY（console.typesafe.ai/keys 获取）"
-    end
-    return Threaded.create({
-      mode = "curl",
-      url = env("SGS_JEV_URL") or "https://api.typesafe.ai/v1/systemone",
-      protocol = "jev",
-      model = env("SGS_JEV_MODEL") or "jev-latest",
-      api_key = key,
-      timeout = 15,   -- 官方标称 70~500ms，留足余量
-    }), nil
+  if engine == "jev" or (engine == "mixed" and opts.engine_only == "jev") then
+    return jevFromEnv(env)
   end
   local model = env("SGS_AI_MODEL")
   local mode = env("SGS_AI_TRANSPORT") or "curl"
@@ -290,4 +311,37 @@ local function fromEnv(opts)
   }), nil
 end
 
-return { Threaded = Threaded, fromEnv = fromEnv }
+-- 混合模式（SGS_AI_ENGINE=mixed）：返回 (llm_t, jev_t, err)。
+-- llm 走常规 SGS_AI_*；jev 走 SGS_JEV_*。err 是两者中致命问题的合并
+-- （至少一个可用即返回可用项，另一个为 nil 时附提示）。
+local function fromEnvMixed(opts)
+  opts = opts or {}
+  local real_env = opts.env or os.getenv
+  -- llm 部分：屏蔽 SGS_AI_ENGINE 让 fromEnv 走 llm 路径
+  local llm_t, llm_err = fromEnv({
+    env = function(name)
+      if name == "SGS_AI_ENGINE" then return nil end
+      return real_env(name)
+    end,
+    reasoning = opts.reasoning,
+  })
+  -- jev 部分：强制走 jev 分支
+  local jev_t, jev_err = fromEnv({
+    env = function(name)
+      if name == "SGS_AI_ENGINE" then return "jev" end
+      return real_env(name)
+    end,
+    engine_only = "jev",
+  })
+  local errs = {}
+  if not llm_t then errs[#errs + 1] = "llm：" .. tostring(llm_err) end
+  if not jev_t then errs[#errs + 1] = "jev：" .. tostring(jev_err) end
+  -- 两个都不可用才算失败；一个可用时给警告（那些请求类型会走机械兜底）
+  if not llm_t and not jev_t then
+    return nil, nil, table.concat(errs, "；")
+  end
+  return llm_t, jev_t, #errs > 0 and table.concat(errs, "；") or nil
+end
+
+return { Threaded = Threaded, fromEnv = fromEnv, fromEnvMixed = fromEnvMixed,
+  jevFromEnv = jevFromEnv }

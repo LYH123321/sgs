@@ -90,21 +90,66 @@ end
 
 local function choiceKey(id) return "a" .. id end
 
--- 单选类请求：一个 choice 问题，criteria = 动作编号 → 描述
+-- 单选类请求：一个 choice 问题，criteria = 动作编号 → 描述。
+-- 高基数两段式：候选超过 MAX_CHOICES（choice 基数官方上限 255，留余量）
+-- 时，choice 的 criteria 只保留**代表子集**——同牌名只留首个目标（首目标
+-- 均为距离/体力最优的枚举序），pass 恒保留；同时给全部候选并行 score
+-- 「进攻/使用收益」，映射阶段若 score 的 top 不在 choice 集里则改用
+-- score 结果（等价于两段式：先打分后精选，且仍是一次 API 调用）。
+local USE_GAIN_RUBRIC = {
+  "负收益或无意义",
+  "收益一般，可有可无",
+  "收益明显，值得使用",
+}
 local function singleChoiceQuestion(req, actions)
   local criteria = {}
   local has_pass = false
+  local seen_name = {}
+  local pruned = false
+  local n_crit = 0
   for _, a in ipairs(actions) do
-    criteria[choiceKey(a.id)] = a.desc
-    if a.kind == "pass" then has_pass = true end
+    local keep = true
+    if a.kind == "use" and #actions > Jev.MAX_CHOICES then
+      -- 两段式裁剪：同 card.name（转化技按生成牌名）只留一个目标
+      local key = a.card and a.card.name or ("id" .. a.id)
+      if seen_name[key] then
+        keep = false
+        pruned = true
+      else
+        seen_name[key] = true
+      end
+    end
+    if keep then
+      criteria[choiceKey(a.id)] = a.desc
+      n_crit = n_crit + 1
+      if a.kind == "pass" then has_pass = true end
+    end
   end
   local r = View.requestBrief(req)
-  return {
+  local q = {
     type = "choice",
     instructions = "当前需要决定：" .. (r and r.ask or "选择一个动作")
       .. "。从下列合法动作中选出对达成你的身份目标最优的一个。",
     criteria = criteria,
-  }, has_pass
+  }
+  return q, has_pass, pruned, n_crit
+end
+
+-- 两段式的并行 score 问题：全部 use 候选的收益评估（choice 被裁剪时，
+-- score 覆盖全集，映射时可以恢复被裁掉的候选）
+local function gainQuestions(req, actions, questions)
+  local order = {}
+  for _, a in ipairs(actions) do
+    if a.kind == "use" then
+      questions["gain" .. a.id] = {
+        type = "score",
+        instructions = "评估动作「" .. a.desc .. "」在当前局面下的使用收益",
+        criteria = USE_GAIN_RUBRIC,
+      }
+      order[#order + 1] = a.id
+    end
+  end
+  return order
 end
 
 -- 技能发动：noul 直接问值不值得
@@ -284,9 +329,21 @@ function Jev.build(room, req, actions, opts)
     questions["invoke"] = invokeQuestion(req)
   else
     ctx.single = true
-    local q, has_pass = singleChoiceQuestion(req, actions)
+    local q, has_pass, pruned, n_crit = singleChoiceQuestion(req, actions)
     questions["action"] = q
     ctx.has_pass = has_pass
+    ctx.pruned = pruned
+    if pruned then
+      ctx.gain_order = gainQuestions(req, actions, questions)
+    end
+    -- 高风险复核：choice 选了高风险动作时，用并行的 confirm noul
+    -- 再确认一次（决斗/救桃给反贼/南蛮万箭这类可能引火烧身的决策）。
+    -- 复核在同一调用里完成（Jev 并行求值），映射阶段按动作类别检查。
+    questions["confirm"] = {
+      type = "noul",
+      instructions = "你选定的动作虽然是收益最大的，但其风险（被反杀、"
+        .. "救活敌人、浪费关键牌、暴露身份引来集火）仍然可以接受",
+    }
   end
 
   -- 身份推测（可选并行问题，不参与本次动作映射）
@@ -309,7 +366,8 @@ function Jev.build(room, req, actions, opts)
 end
 
 -- 把 Jev 响应 JSON 映射成引擎响应。answers = data.answers 表。
--- 返回与 Parse.response 相同的三元组 (resp, err, extra)；
+-- 返回与 Parse.response 相同的三元组 (resp, err, extra)；extra 额外带
+-- probs（动作概率分布）与 belief_probs（各座位身份概率），供 UI 展示。
 -- err 走 Agent 现有降级链（重试关闭时直接机械兜底）。
 function Jev.map(answers, req, room, actions, build_ctx, min_conf)
   if type(answers) ~= "table" then return nil, "answers 缺失" end
@@ -319,13 +377,22 @@ function Jev.map(answers, req, room, actions, build_ctx, min_conf)
   -- 身份推测（先算，任何路径都要带上）
   local picks = reconcileBeliefs(answers, build_ctx.belief_targets or {})
   local beliefs = {}
+  local belief_probs = {}
   local seat_to_name = {}
   for _, p in ipairs(room.players) do seat_to_name[p.seat] = p.name end
   for seat, pick in pairs(picks) do
     local name = seat_to_name[seat]
     if name then beliefs[name] = pick.label end
   end
+  for _, o in ipairs(build_ctx.belief_targets or {}) do
+    local a = answers["belief" .. o.seat]
+    if type(a) == "table" and type(a.probabilities) == "table" then
+      local name = seat_to_name[o.seat]
+      if name then belief_probs[name] = a.probabilities end
+    end
+  end
   if next(beliefs) then extra.beliefs = beliefs end
+  if next(belief_probs) then extra.belief_probs = belief_probs end
 
   if build_ctx.discard then
     local ids = pickDiscard(answers, build_ctx.discard_order, req, actions,
@@ -360,6 +427,48 @@ function Jev.map(answers, req, room, actions, build_ctx, min_conf)
   -- 单选路径
   local a = answers["action"]
   local id, note, mode = pickChoice(a, actions, min_conf)
+
+  -- 两段式恢复：choice 被 prune 后，score 的 top 若优于 choice 结果，
+  -- 用 score 期望最高的候选（gain score 与 choice 在同一次调用里并行，
+  -- score 覆盖未被裁剪的全集）
+  if id and build_ctx.pruned and build_ctx.gain_order then
+    local GAIN_W = { 0.0, 0.5, 1.0 }
+    local best_ev, best_id = -1, nil
+    for _, gid in ipairs(build_ctx.gain_order) do
+      local g = answers["gain" .. gid]
+      local gp = g and g.probabilities or {}
+      local ev = 0
+      for lv, w in pairs(GAIN_W) do
+        ev = ev + (gp[tostring(lv - 1)] or 0) * w
+      end
+      if ev > best_ev then best_ev, best_id = ev, gid end
+    end
+    -- score 全票高收益（≥0.9）且与 choice 不同：score 更可信（未被裁剪）
+    if best_id and best_id ~= id and best_ev >= 0.9 then
+      extra.reason = string.format("两段式score改判（期望%.2f）", best_ev)
+      id = best_id
+    end
+  end
+
+  -- 高风险复核：confirm noul 否定且存在 pass → 保守放弃。
+  -- 复核只拦「主动使用」（use）；pass 本身无风险，不需要复核。
+  if id then
+    local act = actions[id]
+    if act and act.kind == "use" then
+      local confirm = answers["confirm"]
+      local ok = confirm and confirm.noul
+      if ok ~= nil and ok < Jev.INVOKE_THRESHOLD and build_ctx.has_pass then
+        extra.reason = string.format("复核未过（%.2f），保守放弃", ok)
+        for _, pact in ipairs(actions) do
+          if pact.kind == "pass" then
+            id = pact.id
+            break
+          end
+        end
+      end
+    end
+  end
+
   if not id then
     if mode == "lowconf" then
       -- 低置信但答案合法：存在「pass/不打出」类候选时宁可保守，
@@ -383,6 +492,19 @@ function Jev.map(answers, req, room, actions, build_ctx, min_conf)
   local probs = a and a.probabilities or {}
   local top_p = probs[choiceKey(id)]
   if top_p then extra.reason = string.format("概率%.0f%%", top_p * 100) end
+  -- 动作概率分布（UI 推测面板用）：top3 + 中文描述
+  local ranked = {}
+  for key, p in pairs(probs) do
+    local n = tostring(key):match("^a(%d+)$")
+    local aid = n and tonumber(n)
+    if aid and actions[aid] and type(p) == "number" then
+      ranked[#ranked + 1] = { id = aid, p = p, desc = actions[aid].desc }
+    end
+  end
+  table.sort(ranked, function(x, y) return x.p > y.p end)
+  extra.probs = {}
+  for i = 1, math.min(3, #ranked) do extra.probs[i] = ranked[i] end
+  if a.confidence then extra.confidence = a.confidence end
   local resp, serr = Parse.response(Json.encode({ action = id }), req, room, actions)
   if serr then return nil, serr end
   return resp, nil, extra

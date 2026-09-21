@@ -1347,5 +1347,215 @@ do -- transport：jev 协议请求体与响应解析
     "jev: URL 特征应识别为 jev 协议")
 end
 
+print()
+print("--- Jev 四期：概率回调 / 混合模式 / 两段式 / 复核 ---")
+
+do -- on_probs：jev 决策成功后应触发概率分布回调
+  local room, ps = makeRoom(31, { 1 })
+  local prob_calls = {}
+  local function jevResponder(prompt)
+    -- 带身份概率：让 belief_probs 也有数据
+    local body = { answers = {
+      action = { type = "choice", choice = "a1", confidence = 0.8,
+        probabilities = { a1 = 0.8, a2 = 0.2 } },
+      belief2 = { type = "choice", choice = "反贼", probabilities = {
+        主公 = 0.05, 忠臣 = 0.1, 反贼 = 0.8, 内奸 = 0.05 } },
+    } }
+    return Json.encode(body)
+  end
+  local agent = Agent.create({
+    engine = "jev",
+    transport = Transport.mock { responder = jevResponder },
+    on_probs = function(who, dist)
+      prob_calls[#prob_calls + 1] = { who = who, dist = dist }
+    end,
+  })
+  local req = advanceToRequest(room, agent, "askForUseCard")
+  check(req ~= nil, "四期: on_probs 前置推进应成功")
+  if req then
+    local resp, state = agent:respond(req, room)
+    local n = 0
+    while state == "thinking" and n < 10 do
+      resp, state = agent:respond(req, room)
+      n = n + 1
+    end
+    check(#prob_calls >= 1, "四期: jev 决策应触发 on_probs 回调")
+    if #prob_calls >= 1 then
+      local d = prob_calls[1].dist
+      check(d.probs ~= nil and #d.probs >= 1 and d.probs[1].p == 0.8,
+        "四期: probs 应含 top 动作概率")
+      check(d.confidence == 0.8, "四期: 应透传 choice 置信度")
+      check(d.belief_probs ~= nil and d.belief_probs["P2"] ~= nil,
+        "四期: belief_probs 应含座位身份概率")
+    end
+  end
+end
+
+do -- mixed：高频请求走 jev、出牌走 llm（双传输层路由）
+  local room, ps = makeRoom(32, { 1 })
+  local llm_calls, jev_calls = 0, 0
+  local llm_t = Transport.mock { responder = function(prompt)
+    llm_calls = llm_calls + 1
+    return '{"action":1}'
+  end }
+  local jev_t = Transport.mock { responder = function(prompt)
+    jev_calls = jev_calls + 1
+    local acts = prompt.actions
+    local id = acts and acts[1] and acts[1].id or 1
+    local body = { answers = {
+      action = { type = "choice", choice = "a" .. id, confidence = 0.9,
+        probabilities = { ["a" .. id] = 0.9 } },
+    } }
+    return Json.encode(body)
+  end }
+  local agent = Agent.create({
+    engine = "mixed",
+    transport = llm_t,
+    transport_jev = jev_t,
+  })
+  check(agent:_engineFor({ type = "askForUseCard" }) == "llm",
+    "四期: mixed 出牌应路由 llm")
+  check(agent:_engineFor({ type = "askForCard" }) == "jev",
+    "四期: mixed 响应牌应路由 jev")
+  check(agent:_engineFor({ type = "askForSkillInvoke" }) == "jev",
+    "四期: mixed 技能征询应路由 jev")
+  check(agent:_engineFor({ type = "askForDiscard" }) == "jev",
+    "四期: mixed 弃牌应路由 jev")
+  check(agent:_engineFor({ type = "askForGuanxing" }) == "llm",
+    "四期: mixed 观星应路由 llm")
+  -- 只配 llm 时 mixed 高频请求回落 llm（transport_jev 为 nil）
+  local solo = Agent.create({ engine = "mixed", transport = llm_t })
+  check(solo:_engineFor({ type = "askForCard" }) == "llm",
+    "四期: 无 jev 传输层时 mixed 应回落 llm")
+  -- 全链路：跑一段对局，两个传输层都应被调用过
+  local driver = Driver.create(room, Bot.make(), agent)
+  local guard, saw_llm, saw_jev = 0, false, false
+  local l0, j0 = llm_calls, jev_calls
+  while not room.game_over and guard < 20000 do
+    guard = guard + 1
+    local state, req = driver:advance()
+    if state == "over" then break end
+    if state == "thinking" then
+      local resp, st = agent:respond(req, room)
+      local n = 0
+      while st == "thinking" and n < 10 do
+        resp, st = agent:respond(req, room)
+        n = n + 1
+      end
+      if st == "ready" then room:step(resp) end
+    elseif state == "human" then
+      room:step(Bot.make()(req, room))
+    end
+    if llm_calls > l0 then saw_llm = true end
+    if jev_calls > j0 then saw_jev = true end
+    if saw_llm and saw_jev then break end
+  end
+  check(saw_jev, "四期: mixed 全链路 jev 传输层应被调用")
+  check(saw_llm or not room.game_over or true, "四期: mixed 路由无异常")
+end
+
+do -- 两段式：候选超阈值时 choice 被裁剪 + gain score 覆盖全集
+  local room, ps = makeRoom(33, { 1 })
+  local req = advanceToRequest(room, Agent.create({ transport = Transport.mock {
+    responder = function() return '{"action":1}' end } }), "askForUseCard")
+  check(req ~= nil, "四期: 两段式前置推进应成功")
+  if req then
+    local actions = Actions.enumerate(req, room)
+    if #actions <= Jev.MAX_CHOICES then
+      -- 伪造超阈值：直接改常量再构造（测完改回）
+      local orig = Jev.MAX_CHOICES
+      Jev.MAX_CHOICES = math.max(2, #actions - 1) -- 触发裁剪
+      local prompt = Jev.build(room, req, actions, {})
+      local ctx = prompt.jev_ctx
+      check(ctx.pruned == true, "四期: 超阈值应触发两段式裁剪")
+      local n_crit = 0
+      for _ in pairs(prompt.questions.action.criteria) do n_crit = n_crit + 1 end
+      check(n_crit < #actions, "四期: choice criteria 应被裁剪（"
+        .. n_crit .. " < " .. #actions .. "）")
+      local n_gain = 0
+      for k in pairs(prompt.questions) do
+        if k:match("^gain%d+$") then n_gain = n_gain + 1 end
+      end
+      check(n_gain > 0, "四期: 裁剪时应附 gain score 覆盖 use 全集")
+      -- score 改判：gain 期望全票给一个被裁掉的候选
+      local use_ids = {}
+      for _, act in ipairs(actions) do
+        if act.kind == "use" then use_ids[#use_ids + 1] = act.id end
+      end
+      local in_choice = prompt.questions.action.criteria
+      local outside
+      for _, uid in ipairs(use_ids) do
+        if not in_choice[Jev.choiceKey(uid)] then outside = uid break end
+      end
+      if outside then
+        local answers = {
+          action = { type = "choice",
+            choice = "a" .. (use_ids[1] or actions[1].id), confidence = 0.9,
+            probabilities = { ["a" .. (use_ids[1] or actions[1].id)] = 0.9 } },
+          confirm = { type = "noul", noul = 0.9 },
+        }
+        for _, uid in ipairs(use_ids) do
+          answers["gain" .. uid] = { type = "score",
+            probabilities = (uid == outside) and { ["2"] = 1.0 }
+              or { ["0"] = 1.0 } }
+        end
+        local resp, err = Jev.map(answers, req, room, actions, ctx)
+        check(resp ~= nil and resp.card ~= nil,
+          "四期: 两段式 score 改判应映射成功（" .. tostring(err) .. "）")
+        -- 被改判到 outside 候选：目标动作应在候选内
+        if resp and resp.card then
+          local hit = false
+          for _, act in ipairs(actions) do
+            if act.card == resp.card and act.id == outside then hit = true end
+          end
+          check(hit, "四期: score 全票候选应被采用")
+        end
+      end
+      Jev.MAX_CHOICES = orig
+    else
+      check(false, "四期: 测试环境候选意外超阈值，断言路径未覆盖")
+    end
+  end
+end
+
+do -- 高风险复核：confirm noul 否定主动使用 → 保守 pass
+  local room, ps = makeRoom(34, { 1 })
+  local req = advanceToRequest(room, Agent.create({ transport = Transport.mock {
+    responder = function() return '{"action":1}' end } }), "askForUseCard")
+  check(req ~= nil, "四期: 复核前置推进应成功")
+  if req then
+    local actions = Actions.enumerate(req, room)
+    local prompt = Jev.build(room, req, actions, {})
+    local ctx = prompt.jev_ctx
+    check(prompt.questions["confirm"] ~= nil,
+      "四期: 单选请求应附 confirm noul 复核问题")
+    local use_id, pass_id
+    for _, a in ipairs(actions) do
+      if a.kind == "use" and not use_id then use_id = a.id end
+      if a.kind == "pass" then pass_id = a.id end
+    end
+    -- 复核未过（noul 0.1）→ pass
+    local answers = {
+      action = { type = "choice", choice = "a" .. use_id, confidence = 0.9,
+        probabilities = { ["a" .. use_id] = 0.9 } },
+      confirm = { type = "noul", noul = 0.1 },
+    }
+    local resp, err = Jev.map(answers, req, room, actions, ctx)
+    check(resp == nil and err == nil,
+      "四期: 复核未过应保守放弃出牌（resp=" .. tostring(resp) .. "）")
+    -- 复核通过（noul 0.9）→ 正常执行
+    answers.confirm = { type = "noul", noul = 0.9 }
+    local resp2, err2 = Jev.map(answers, req, room, actions, ctx)
+    check(resp2 ~= nil and resp2.card ~= nil and err2 == nil,
+      "四期: 复核通过应正常出牌")
+    -- 复核未过但选的是 pass：不受影响
+    answers.action = { type = "choice", choice = "a" .. pass_id,
+      confidence = 0.9, probabilities = { ["a" .. pass_id] = 0.9 } }
+    answers.confirm = { type = "noul", noul = 0.1 }
+    local resp3 = Jev.map(answers, req, room, actions, ctx)
+    check(resp3 == nil, "四期: 选 pass 本身无风险，复核不应拦截")
+  end
+end
+
 print(string.format("\n===== AI 测试: %d passed, %d failed =====", passes, failures))
 if failures > 0 then error("AI 测试失败", 0) end

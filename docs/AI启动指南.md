@@ -59,6 +59,23 @@ export SGS_JEV_KEY="ts-..."         # https://console.typesafe.ai/keys 获取
 
 设计与实现细节见 `JEV接入方案.md`；联机服务端（`SGS_NET_AI`）同样支持。
 
+Jev 也可以走代理（密钥不进游戏进程）：游戏侧 `SGS_AI_ENGINE=jev` +
+`SGS_AI_TRANSPORT=proxy`，代理侧（`tools/ai_proxy.py` 终端）配
+`SGS_JEV_KEY` 即可。
+
+### 方式四：混合模式（jev 管高频、llm 管长推理）
+
+同时配好对话 LLM（方式一/二）与 Jev（方式三）后，设：
+
+```bash
+export SGS_AI_ENGINE=mixed
+./run-game.sh
+```
+
+路由规则：响应牌、技能征询、弃牌、五谷选牌、拆牌、观星外选项这类
+「几秒内可判断」的原子决策走 **Jev**（快、便宜）；出牌阶段与观星这类
+长推理走 **llm**。单边不可用时自动整体回落到可用的一侧。
+
 ---
 
 ## 二、环境变量一览
@@ -73,7 +90,7 @@ export SGS_JEV_KEY="ts-..."         # https://console.typesafe.ai/keys 获取
 | `SGS_AI_PROTOCOL` | 接口形态 `chat` / `responses` | 按 URL 猜，默认 `responses` |
 | `SGS_AI_REASONING` | 思维链强度 `none` / `low` / ...（Responses 协议） | `none` |
 | `SGS_AI_THINKING` | chat 协议思维链（GLM 系）：`off` / `on` / `auto`（不发字段） | 跟随 AI 思考档 |
-| `SGS_AI_ENGINE` | 决策引擎：`llm`（默认）/ `jev`（TypeSafe System One） | `llm` |
+| `SGS_AI_ENGINE` | 决策引擎：`llm`（默认）/ `jev`（TypeSafe System One）/ `mixed`（jev 管高频 + llm 管长推理） | `llm` |
 | `SGS_JEV_KEY` | Jev 密钥（engine=jev 时必填） | 无 |
 | `SGS_JEV_URL` | Jev 端点 | `https://api.typesafe.ai/v1/systemone` |
 | `SGS_JEV_MODEL` | Jev 模型名 | `jev-latest` |
