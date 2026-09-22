@@ -385,6 +385,31 @@ end
 -- 返回与 Parse.response 相同的三元组 (resp, err, extra)；extra 额外带
 -- probs（动作概率分布）与 belief_probs（各座位身份概率），供 UI 展示。
 -- err 走 Agent 现有降级链（重试关闭时直接机械兜底）。
+-- 把 choice 响应的概率分布渲染成一行可读文本（失败日志用）：
+-- 「置信0.15｜出杀→张三 32%、结束出牌 28%、吃桃 15%」
+local function renderChoiceDist(answer, actions)
+  if type(answer) ~= "table" then return "" end
+  local ranked = {}
+  for key, p in pairs(answer.probabilities or {}) do
+    local n = tostring(key):match("^a(%d+)$")
+    local id = n and tonumber(n)
+    if id and actions[id] and type(p) == "number" then
+      ranked[#ranked + 1] = { p = p, desc = actions[id].desc }
+    end
+  end
+  table.sort(ranked, function(x, y) return x.p > y.p end)
+  local parts = {}
+  for i = 1, math.min(5, #ranked) do
+    parts[#parts + 1] = string.format("%s %d%%", ranked[i].desc,
+      math.floor(ranked[i].p * 100 + 0.5))
+  end
+  local out = ""
+  if answer.confidence then
+    out = string.format("置信%.2f｜", answer.confidence)
+  end
+  return out .. (#parts > 0 and table.concat(parts, "、") or "(无概率分布)")
+end
+
 function Jev.map(answers, req, room, actions, build_ctx, min_conf)
   if type(answers) ~= "table" then return nil, "answers 缺失" end
   min_conf = min_conf or Jev.DEFAULT_MIN_CONFIDENCE
@@ -508,7 +533,11 @@ function Jev.map(answers, req, room, actions, build_ctx, min_conf)
         end
       end
     end
-    -- invalid（API 违约）或低置信且无 pass：报错走机械兜底
+    -- invalid（API 违约）或低置信且无 pass：报错走机械兜底。
+    -- extra.fallback_dist 带上当时的候选分布，agent 打进日志供排查
+    if mode == "lowconf" and type(a) == "table" then
+      extra.fallback_dist = renderChoiceDist(a, actions)
+    end
     return nil, note or "单选映射失败", extra
   end
   if note then extra.reason = note end

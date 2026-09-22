@@ -240,7 +240,15 @@ function Agent:_poll(req, room)
       end
     end
     if err then
-      print(string.format("[AI/jev] 决策未通过（%s）", tostring(err)))
+      -- 附当时的候选分布（低置信时 map 在 extra.fallback_dist 里带回）：
+      -- 「决策未通过」只有原因没有内容，排查时不知道 Jev 当时想选什么
+      local dist = extra and extra.fallback_dist
+      if dist and dist ~= "" then
+        print(string.format("[AI/jev] 决策未通过（%s）｜当时候选：%s",
+          tostring(err), dist))
+      else
+        print(string.format("[AI/jev] 决策未通过（%s）", tostring(err)))
+      end
       self.stats.rejections[#self.stats.rejections + 1] = tostring(err)
       if #self.stats.rejections > 20 then table.remove(self.stats.rejections, 1) end
       -- Jev 是无状态决策器，重问同一问题没有意义：直接走机械兜底
