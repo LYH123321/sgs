@@ -131,7 +131,14 @@ local function parseResponse(out, protocol)
 
   if (protocol or DEFAULT_PROTOCOL) == "jev" then
     -- System One 的结构化决策：整包 JSON 原样放回 text，answers 的解构
-    -- 与合法性校验在 jev.lua（那里才知道 questions 的语义）
+    -- 与合法性校验在 jev.lua（那里才知道 questions 的语义）。
+    -- 422 校验错误体是 {"detail":[...]}（FastAPI 风格），上面只查了
+    -- error 字段拦不住——这里把 detail 直接报为错误，避免误判成功。
+    if data.detail ~= nil and data.answers == nil then
+      local d = data.detail
+      local msg = type(d) == "table" and d[1] and d[1].msg or d
+      return { ok = false, err = "请求被拒（422）：" .. tostring(msg) }
+    end
     return { ok = true, text = out, usage = data.usage }
   end
 

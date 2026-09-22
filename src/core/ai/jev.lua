@@ -191,7 +191,21 @@ end
 
 -- 身份推测：对每个身份未知的存活他人问一个 choice。
 -- 返回 questions 与座位上下文（映射时做矛盾调和）。
+-- 注意：choice 的 criteria 必须是**字典**（key→描述），传数组会被
+-- API 422 拒绝（Input should be a valid dictionary）——实测踩过。
 local BELIEF_OPTIONS = { "主公", "忠臣", "反贼", "内奸" }
+local function beliefCriteria()
+  local t = {}
+  for i, label in ipairs(BELIEF_OPTIONS) do t["r" .. i] = label end
+  return t
+end
+-- rN key → 中文身份。中文字面量原样放行（mock/旧响应兼容）。
+local BELIEF_KEYS = {}
+for i, label in ipairs(BELIEF_OPTIONS) do BELIEF_KEYS["r" .. i] = label end
+for _, label in ipairs(BELIEF_OPTIONS) do BELIEF_KEYS[label] = label end
+local function beliefLabelOf(key)
+  return BELIEF_KEYS[tostring(key)]
+end
 local function beliefQuestions(view)
   local questions, targets = {}, {}
   for _, o in ipairs(view.others) do
@@ -201,7 +215,7 @@ local function beliefQuestions(view)
         instructions = string.format(
           "根据行为推断%d号位%s(%s)最可能的隐藏身份（结合战况与你的决策史）",
           o.seat, o.name, o.general),
-        criteria = BELIEF_OPTIONS,
+        criteria = beliefCriteria(),
       }
       targets[#targets + 1] = o
     end
@@ -282,8 +296,10 @@ local function reconcileBeliefs(answers, targets)
     local a = answers["belief" .. o.seat]
     if type(a) == "table" and a.probabilities then
       local top_label, top_p
-      for label, p in pairs(a.probabilities) do
-        if type(p) == "number" and (not top_p or p > top_p) then
+      for key, p in pairs(a.probabilities) do
+        -- criteria 是 rN→身份 的字典，probabilities 的 key 同为 rN
+        local label = beliefLabelOf(key)
+        if label and type(p) == "number" and (not top_p or p > top_p) then
           top_label, top_p = label, p
         end
       end
@@ -388,7 +404,15 @@ function Jev.map(answers, req, room, actions, build_ctx, min_conf)
     local a = answers["belief" .. o.seat]
     if type(a) == "table" and type(a.probabilities) == "table" then
       local name = seat_to_name[o.seat]
-      if name then belief_probs[name] = a.probabilities end
+      if name then
+        -- rN key 转回中文身份，UI 直接显示
+        local by_label = {}
+        for key, p in pairs(a.probabilities) do
+          local label = beliefLabelOf(key)
+          if label and type(p) == "number" then by_label[label] = p end
+        end
+        if next(by_label) then belief_probs[name] = by_label end
+      end
     end
   end
   if next(beliefs) then extra.beliefs = beliefs end
@@ -485,7 +509,7 @@ function Jev.map(answers, req, room, actions, build_ctx, min_conf)
       end
     end
     -- invalid（API 违约）或低置信且无 pass：报错走机械兜底
-    return nil, note or "单选映射失败"
+    return nil, note or "单选映射失败", extra
   end
   if note then extra.reason = note end
   -- top 概率写进 reason（记忆里能看到为什么）
@@ -518,6 +542,19 @@ function Jev.answersFrom(text)
   if data.error then
     local e = data.error
     return nil, "接口错误：" .. tostring(type(e) == "table" and (e.message or e.code) or e)
+  end
+  -- FastAPI 风格的 422 校验错误：{"detail":[{type,loc,msg},...]}。
+  -- 不识别它会被误报成「响应缺少 answers」，真正的拒绝原因（如 criteria
+  -- 类型不对）全被吞掉——实测踩过：belief 的 criteria 传了数组，所有请求
+  -- 422，日志只见「缺少 answers」。
+  if data.detail ~= nil then
+    local d = data.detail
+    if type(d) == "table" and d[1] and d[1].msg then
+      local loc = d[1].loc and table.concat(d[1].loc, ".") or "?"
+      return nil, string.format("请求被拒（422）：%s @ %s",
+        tostring(d[1].msg), loc)
+    end
+    return nil, "接口错误：" .. tostring(d)
   end
   if type(data.answers) ~= "table" then return nil, "响应缺少 answers" end
   return data.answers
