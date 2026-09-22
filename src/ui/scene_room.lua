@@ -1224,6 +1224,10 @@ function RoomScene:playPresent(e)
   elseif e.kind == "skillTarget" then
     -- 技能指定目标：施法者 → 目标画一条指向箭头，并高亮目标面板
     if d and d.player and d.target and fx then
+      -- 借刀杀人等复合结算补充的说明横幅（普通技能指向没有 banner 不刷屏）
+      if d.banner then
+        fx:showBanner(d.banner, { 0.95, 0.85, 0.35 })
+      end
       local x1, y1 = self:panelCenter(d.player)
       local x2, y2 = self:panelCenter(d.target)
       if x1 and x2 then fx:arrow(x1, y1, x2, y2) end

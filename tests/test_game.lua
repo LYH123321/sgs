@@ -3189,6 +3189,9 @@ do -- 使用者指定目标，持有者出杀 → 对指定目标结算
   local weapon = Card.create(3001, "crossbow", Card.Suit.Club, 1, Card.Type.Equip)
   ps[2].equips.weapon = weapon
   local slash = give(ps[2], "slash", Card.Suit.Spade, 7)
+  -- 表现层事件：借刀指定目标后应广播 持有者→受害人 的指向（UI 画箭头用）
+  local fired = {}
+  r:onEvent("skillTarget", function(d) fired[#fired + 1] = d end)
   local co = coroutine.create(function()
     return Cards2.get("collateral").effect(r, { from = ps[1], card = nil, to = { ps[2] } })
   end)
@@ -3202,6 +3205,9 @@ do -- 使用者指定目标，持有者出杀 → 对指定目标结算
   local _, req2 = coroutine.resume(co, ps[3].name)  -- 指定 ps[3]
   check(req2 and req2.card_name == "slash" and req2.player == ps[2],
     "持有者应被要求出杀")
+  check(#fired == 1 and fired[1].player == ps[2] and fired[1].target == ps[3]
+    and fired[1].skill == "借刀杀人" and fired[1].banner ~= nil,
+    "指定目标后应发 skillTarget 事件（持有者→受害人 + banner）")
   local _, req3 = coroutine.resume(co, slash)
   check(req3 and req3.card_name == "dodge" and req3.player == ps[3],
     "杀应作用于**指定的**目标而非自动选第一个")

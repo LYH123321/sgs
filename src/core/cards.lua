@@ -303,6 +303,14 @@ Cards.define("collateral", {
     end
     if not victim then victim = candidates[1] end
 
+    -- 表现层：useCard 事件只带 use.to（武器持有者），真正的受害人在这里
+    -- 才确定。补发指向事件让 UI 画出「武器持有者 → 受害人」的箭头与横幅，
+    -- 否则玩家只看到借刀给谁，看不到刀要砍谁。
+    room:emit("skillTarget", {
+      player = to, target = victim, skill = "借刀杀人",
+      banner = string.format("【借刀杀人】%s 需对 %s 使用【杀】", to.name, victim.name),
+    })
+
     local slash = room:askForCard(to, "slash",
       string.format("借刀杀人：对 %s 使用【杀】，否则武器归 %s", victim.name, from.name))
     if slash and to:takeCard(slash) then
