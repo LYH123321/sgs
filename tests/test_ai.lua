@@ -1059,6 +1059,137 @@ do -- JSON 自动修复：模型少写闭合引号的高频笔误（glm-5-turbo 
     "坏 JSON 经修复应解析出动作（resp=" .. tostring(resp) .. " err=" .. tostring(err) .. "）")
 end
 
+do -- 文本动作模糊匹配：弱模型无视编号格式，把候选标签抄进 action
+   -- （hy-mt2-lite 实测原文："出C2-杀"、"结束出牌"、"弃掉C2-杀"）
+  local Card = require "src.core.card"
+  local room, ps = makeRoom(21, { 1 })
+  local me = ps[1]
+  local c1 = Card.create(201, "slash", Card.Suit.Club, 2)   -- C2-杀
+  local c2 = Card.create(202, "slash", Card.Suit.Spade, 7)  -- S7-杀
+  local acts = {
+    { id = 1, kind = "use", desc = "出【C2-杀】 → P2（体力 4/4，手牌 4 张，距离 1）",
+      card = c1, target_seat = 2 },
+    { id = 2, kind = "use", desc = "出【C2-杀】 → P3（体力 4/4，手牌 4 张，距离 2）",
+      card = c1, target_seat = 3 },
+    { id = 3, kind = "use", desc = "出【S7-杀】 → P2（体力 4/4，手牌 4 张，距离 1）",
+      card = c2, target_seat = 2 },
+    { id = 4, kind = "pass", desc = "结束出牌" },
+  }
+  local req = { type = "askForUseCard", player = me }
+
+  -- 完整标签：出C2-杀（同牌两个目标 → 取距离最近的 P2）
+  local r1, e1 = Parse.response('{"action": "出C2-杀", "reason": "打近的"}', req, room, acts)
+  check(r1 and r1.card == c1 and r1.target == ps[2] and e1 == nil,
+    "文本动作「出C2-杀」应匹配到梅花杀打P2（实得 card="
+      .. tostring(r1 and r1.card and r1.card:displayName()) .. " err=" .. tostring(e1) .. "）")
+
+  -- 用户实测的坏 JSON（少闭合引号）+ 文本动作，两道修复叠加
+  local r2, e2 = Parse.response(
+    '{"action": "出C2-杀", "reason": "打吕蒙，距离近优先攻击}}', req, room, acts)
+  check(r2 and r2.card == c1 and e2 == nil,
+    "少闭合引号 + 文本动作应修复并匹配（实得 err=" .. tostring(e2) .. "）")
+
+  -- 花色+点数分开出现 + 目标名消歧
+  local r3, e3 = Parse.response('{"action": "用 S7 杀 P2", "reason": "x"}', req, room, acts)
+  check(r3 and r3.card == c2 and e3 == nil,
+    "「S7 + 杀 + P2」应唯一匹配黑桃杀（实得 err=" .. tostring(e3) .. "）")
+
+  -- 结束出牌
+  local r4, e4 = Parse.response('{"action": "结束出牌", "reason": "残血休整"}', req, room, acts)
+  check(r4 == nil and e4 == nil, "「结束出牌」应解析为 pass（r4=" .. tostring(r4) .. "）")
+
+  -- 只有牌名（两张杀都含「杀」）→ 证据不足拒绝，错误信息可指导重试
+  local r5, e5 = Parse.response('{"action": "出杀", "reason": "x"}', req, room, acts)
+  check(r5 == nil and e5 and e5:find("无法对应", 1, true),
+    "只有牌名时应拒绝并给出可读原因（实得 err=" .. tostring(e5) .. "）")
+
+  -- 英文动作 discard：无牌面证据 → 拒绝（reason 里说了弃什么也没用）
+  local r6, e6 = Parse.response('{"action": "discard", "reason": "弃过河拆桥"}', req, room, acts)
+  check(r6 == nil and e6 ~= nil, "无证据的英文动作应拒绝")
+
+  -- 弃牌：actions 文本数组逐张匹配
+  local dreq = { type = "askForDiscard", player = me, n = 2, cards = { c1, c2 } }
+  local dacts = {
+    { id = 1, kind = "discard", desc = "弃掉【C2-杀】", card = c1, card_id = 201 },
+    { id = 2, kind = "discard", desc = "弃掉【S7-杀】", card = c2, card_id = 202 },
+  }
+  local r7, e7 = Parse.response(
+    '{"actions": ["弃掉C2-杀", "弃掉S7-杀"], "reason": "杀太多"}', dreq, room, dacts)
+  check(type(r7) == "table" and #r7 == 2 and r7[1] == c1 and r7[2] == c2 and e7 == nil,
+    "弃牌文本数组应逐张匹配（实得 err=" .. tostring(e7) .. "）")
+
+  -- 编号混解释："1, 保留闪应对双刃拼点"（hy-mt2-lite 实测原文）
+  local cacts = {}
+  for i = 1, 3 do cacts[i] = { id = i, kind = "choice", value = "选项" .. i, desc = "选项" .. i } end
+  local r8, e8 = Parse.response('{"action": "1, 保留闪应对双刃拼点", "reason": "x"}',
+    { type = "askForChoice", player = me }, room, cacts)
+  check(r8 == "选项1" and e8 == nil,
+    "编号+逗号+注释应取编号（实得 resp=" .. tostring(r8) .. " err=" .. tostring(e8) .. "）")
+
+  -- 纯编号列表塞在字符串里："1, 3"（弃牌两张）
+  local c3 = Card.create(203, "dodge", Card.Suit.Heart, 3)
+  local dacts3 = {
+    { id = 1, kind = "discard", desc = "弃掉【C2-杀】", card = c1 },
+    { id = 2, kind = "discard", desc = "弃掉【H3-闪】", card = c3 },
+    { id = 3, kind = "discard", desc = "弃掉【S7-杀】", card = c2 },
+  }
+  local r9, e9 = Parse.response('{"action": "1, 3", "reason": "弃两张杀"}',
+    { type = "askForDiscard", player = me, n = 2, cards = { c1, c3, c2 } }, room, dacts3)
+  check(type(r9) == "table" and #r9 == 2 and r9[1] == c1 and r9[2] == c2 and e9 == nil,
+    "字符串内编号列表应逐个提取（实得 err=" .. tostring(e9) .. "）")
+
+  -- 回归护栏："2杀" 是牌面（点数2的杀），绝不能当成编号 2
+  local r10, e10 = Parse.response('{"action": "2杀", "reason": "x"}',
+    { type = "askForDiscard", player = me, n = 1, cards = { c1, c3, c2 } }, room, dacts3)
+  check(type(r10) == "table" and #r10 == 1 and r10[1] == c1 and e10 == nil,
+    "「2杀」应按牌面匹配到候选1而非编号2（实得 err=" .. tostring(e10) .. "）")
+
+  -- 泛指动词「出牌」：唯一非放弃候选时采纳
+  local uacts = {
+    { id = 1, kind = "use", desc = "出【C2-杀】 → P2（体力 4/4，手牌 4 张，距离 1）",
+      card = c1, target_seat = 2 },
+    { id = 2, kind = "pass", desc = "结束出牌" },
+  }
+  local r11, e11 = Parse.response('{"action": "出牌", "reason": "x"}', req, room, uacts)
+  check(r11 and r11.card == c1 and e11 == nil,
+    "「出牌」在唯一非放弃候选时应采纳（实得 err=" .. tostring(e11) .. "）")
+  -- 多个非放弃候选时仍拒绝（不能瞎猜）
+  local r12, e12 = Parse.response('{"action": "出牌", "reason": "x"}', req, room, acts)
+  check(r12 == nil and e12 and e12:find("无法对应", 1, true),
+    "「出牌」在多个候选时应拒绝（实得 err=" .. tostring(e12) .. "）")
+
+  -- 唯一牌名：只写「出【顺手牵羊】」没写花色点数（hy-mt2-lite 实测）
+  local sn = Card.create(204, "snatch", Card.Suit.Diamond, 3)
+  local sacts = {
+    { id = 1, kind = "use", desc = "出【D3-顺手牵羊】 → P2（体力 4/4，手牌 4 张，距离 1）",
+      card = sn, target_seat = 2 },
+    { id = 2, kind = "use", desc = "出【D3-顺手牵羊】 → P3（体力 4/4，手牌 4 张，距离 2）",
+      card = sn, target_seat = 3 },
+    { id = 3, kind = "use", desc = "出【C2-杀】 → P2（体力 4/4，手牌 4 张，距离 1）",
+      card = c1, target_seat = 2 },
+    { id = 4, kind = "pass", desc = "结束出牌" },
+  }
+  local r13, e13 = Parse.response('{"action": "出【顺手牵羊】", "reason": "x"}', req, room, sacts)
+  check(r13 and r13.card == sn and r13.target == ps[2] and e13 == nil,
+    "唯一牌名应匹配且取最近目标（实得 err=" .. tostring(e13) .. "）")
+  -- 同名多张（两张不同的杀）时仍拒绝
+  local kacts = {
+    { id = 1, kind = "discard", desc = "弃掉【C2-杀】", card = c1 },
+    { id = 2, kind = "discard", desc = "弃掉【S7-杀】", card = c2 },
+  }
+  local r14, e14 = Parse.response('{"action": "弃掉杀", "reason": "x"}',
+    { type = "askForDiscard", player = me, n = 1, cards = { c1, c2 } }, room, kacts)
+  check(r14 == nil and e14 and e14:find("无法对应", 1, true),
+    "同名多张时纯牌名应仍拒绝（实得 err=" .. tostring(e14) .. "）")
+
+  -- curl 网络错误应有明确归因，不再报「不是合法 JSON」
+  local r15, e15 = Parse.response(
+    "curl: (28) Failed to connect to example.com:443 after 21047 ms: Could not connect",
+    req, room, acts)
+  check(r15 == nil and e15 and e15:find("接口调用失败（网络）", 1, true),
+    "curl 错误应报网络原因（实得 err=" .. tostring(e15) .. "）")
+end
+
 do -- 请求摘要的牌名要中文化：thinkingLabel「正在思考：需要打出【闪】」
   local View = require "src.core.ai.view"
   local brief = View.requestBrief({ type = "askForCard", card_name = "dodge" })

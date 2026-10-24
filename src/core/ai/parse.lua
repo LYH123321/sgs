@@ -133,6 +133,219 @@ local function normalizeIds(data)
   return out
 end
 
+-- ===== 文本动作的模糊匹配 =====
+-- 弱模型（实测 hy-mt2-lite）常无视「只回编号」的格式要求，把候选标签
+-- 抄进 action 字段：{"action": "出C2-杀"}。标签里的 C2-杀 正是候选列表
+-- 的 cardLabel（花色字母+点数+牌名），因此可以按「牌面身份」可靠地对回
+-- 候选：完整标签 > 花色+点数 > 点数+牌名，目标名与「结束/不打出」这类
+-- 关键词辅助消歧。分数不够或并列时宁可拒绝走兜底——错误地打出一手
+-- 比保守跳过更伤对局。
+
+-- 归一化文本：去掉空白与装饰符（【】·、——- 等），只留字母数字和 CJK
+local function normText(s)
+  local t = {}
+  for ch in s:gmatch("[%w\128-\255]") do t[#t + 1] = ch end
+  return table.concat(t)
+end
+
+local PASS_HINTS = {
+  { keys = { "结束出牌", "结束", "pass", "end" }, hits = { "结束出牌" } },
+  { keys = { "不打出", "不出", "放弃" }, hits = { "不打出" } },
+  { keys = { "不弃", "不选", "都不弃" }, hits = { "不弃" } },
+  { keys = { "不发动", "不使用", "跳过" }, hits = { "不发动" } },
+}
+
+-- 给一个候选按文本打分；返回分数（0 = 无证据）
+local function scoreAction(text, a, room)
+  local n = normText(text)
+  if n == "" then return 0 end
+  local descN = normText(a.desc or (a.short or ""))
+  if descN ~= "" and descN == n then return 200 end
+
+  local score = 0
+  if a.card then
+    local label = normText(string.format("%s%d%s",
+      a.card:suitString(), a.card.number, a.card:zhName()))
+    local suitNum = normText(a.card:suitString() .. a.card.number)
+    local numName = normText(a.card.number .. a.card:zhName())
+    if n:find(label, 1, true) then score = score + 100 -- 完整标签 C2杀
+    elseif n:find(suitNum, 1, true) and n:find(normText(a.card:zhName()), 1, true) then
+      score = score + 80                                   -- C2 + 杀 分开出现
+    elseif n:find(suitNum, 1, true) then
+      score = score + 70                                   -- 只认 C2（花色+点数仍唯一）
+    elseif n:find(numName, 1, true) then
+      score = score + 60                                   -- 2杀
+    elseif n:find(normText(a.card:zhName()), 1, true) then
+      score = score + 10                                   -- 只有牌名，同名牌多时不可靠
+    end
+  end
+  -- 目标名：同一张牌能打多个目标时靠它消歧
+  if a.target_seat and room then
+    for _, p in ipairs(room.players) do
+      if p.seat == a.target_seat and n:find(normText(p.name), 1, true) then
+        score = score + 30
+        break
+      end
+    end
+  end
+  -- 结束/放弃类关键词（pass 候选的 desc 是固定短语）
+  for _, ph in ipairs(PASS_HINTS) do
+    for _, h in ipairs(ph.hits) do
+      if descN:find(normText(h), 1, true) then
+        for _, k in ipairs(ph.keys) do
+          if n:find(normText(k), 1, true) then score = score + 80 break end
+        end
+        break
+      end
+    end
+  end
+  -- 主动技：发动【X】
+  if a.kind == "invoke" and a.value == true then
+    if n:find("发动", 1, true) then score = score + 60 end
+  end
+  -- 纯选项（askForChoice 的 value 本身就是文案）
+  if a.kind == "choice" and descN ~= "" and n:find(descN, 1, true) then
+    score = score + 100
+  end
+  return score
+end
+
+-- 模型把编号和解释塞进同一个字符串的变体（hy-mt2-lite 实测）：
+--   "1, 保留闪应对双刃拼点"（编号+逗号+注释）、"1, 3"（编号列表）、"第2个"。
+-- 从头解析数字链：数字之间必须是分隔符（逗号/顿号/空白），数字后面
+-- 允许单个量词（号/个/项/位）；一旦数字后直接跟内容（如 "2杀" 是牌面，
+-- 不是编号），整体不按编号解释——宁可走文本匹配，不能把牌点当编号。
+local function extractNumberList(s)
+  if type(s) ~= "string" then return nil end
+  local t = s:gsub("^%s*[第选项编号]+", "")
+  local ids, pos = {}, 1
+  while true do
+    local s0, e0 = t:find("^(%d+)", pos)
+    if not s0 then break end
+    pos = e0 + 1
+    local q = t:match("^[号个项位]", pos)
+    if q then pos = pos + 1 end
+    local sep = t:match("^[%s,，、;；/]+", pos)
+    if sep then
+      pos = pos + #sep
+      ids[#ids + 1] = tonumber(t:sub(s0, e0))
+    elseif pos > #t then
+      ids[#ids + 1] = tonumber(t:sub(s0, e0))
+      break
+    else
+      return nil
+    end
+  end
+  if #ids == 0 then return nil end
+  return ids
+end
+
+-- 泛指动词（"出牌"、"使用"）：模型想出牌但没说哪张。候选里**恰好只有
+-- 一个**非放弃动作时可采纳；多个时无法定夺，仍走拒绝。
+local GENERIC_PLAY = { ["出牌"] = true, ["出一张"] = true, ["打牌"] = true,
+  ["使用"] = true, ["出一张牌"] = true }
+
+-- 把一个文本动作解析成候选编号；无法唯一确定返回 nil
+local function resolveTextAction(text, actions, room)
+  local n = normText(text)
+  local best, best_score = nil, 0
+  local tied = {}
+  for _, a in ipairs(actions) do
+    local s = scoreAction(text, a, room)
+    if s > best_score then
+      best, best_score, tied = a, s, { a }
+    elseif s == best_score and s > 0 then
+      tied[#tied + 1] = a
+    end
+  end
+  -- 门槛：至少要有牌面/关键词级别的证据（≥60），只有牌名（10）不算
+  if best and best_score >= 60 then
+    if #tied == 1 then return best.id end
+    -- 并列且都是**同一张牌的不同目标**（模型说了出这张牌但没说打谁）：
+    -- 选 desc 里距离最近的，仍然并列取靠前的——与机械兜底的结果相当，
+    -- 但保留了 reason / beliefs 等元信息
+    local same_card = true
+    for _, a in ipairs(tied) do
+      if a.card ~= tied[1].card then same_card = false break end
+    end
+    if same_card then
+      local pick, pick_d = tied[1], math.huge
+      for _, a in ipairs(tied) do
+        local d = tonumber(a.desc and a.desc:match("距离 (%d+)")) or math.huge
+        if d < pick_d then pick, pick_d = a, d end
+      end
+      return pick.id
+    end
+    return nil
+  end
+  -- 泛指动词：只在唯一非放弃候选时采纳
+  if GENERIC_PLAY[normText(text)] then
+    local only, count = nil, 0
+    for _, a in ipairs(actions) do
+      if a.kind ~= "pass" then only, count = a, count + 1 end
+    end
+    if count == 1 and only then return only.id end
+  end
+  -- 唯一牌名：模型只写「出【乐不思蜀】」没写花色点数（hy-mt2-lite 实测）。
+  -- 候选里**只有一张**这个牌名的牌时，牌名足以唯一确定；同一张牌的
+  -- 多个目标取距离最近。多张同名（两张杀）仍然拒绝。
+  if best_score < 60 then
+    local byname = {}
+    for _, a in ipairs(actions) do
+      if a.card and n:find(normText(a.card:zhName()), 1, true) then
+        byname[#byname + 1] = a
+      end
+    end
+    if #byname > 0 then
+      local same = true
+      for _, a in ipairs(byname) do
+        if a.card ~= byname[1].card then same = false break end
+      end
+      if same then
+        local pick, pick_d = byname[1], math.huge
+        for _, a in ipairs(byname) do
+          local d = tonumber(a.desc and a.desc:match("距离 (%d+)")) or math.huge
+          if d < pick_d then pick, pick_d = a, d end
+        end
+        return pick.id
+      end
+    end
+  end
+  return nil
+end
+
+-- data.action/actions 是非编号文本时逐个模糊匹配；任何一个匹配失败
+-- 整体作废（半猜半编比保守兜底更危险）。返回编号数组或 nil。
+local function resolveTextIds(data, actions, room)
+  local raw = data.actions
+  if raw == nil and data.action ~= nil then raw = { data.action } end
+  if type(raw) ~= "table" then
+    if type(raw) == "string" then raw = { raw } else return nil end
+  end
+  if #raw == 0 then return nil end
+  local out = {}
+  for _, v in ipairs(raw) do
+    if type(v) == "number" then
+      out[#out + 1] = v
+    elseif type(v) == "string" and tonumber(v) then
+      out[#out + 1] = tonumber(v)
+    elseif type(v) == "string" then
+      -- "1, 保留闪…" / "1, 3" / "第2个"：编号混着解释，先按编号链提取
+      local nums = extractNumberList(v)
+      if nums then
+        for _, n in ipairs(nums) do out[#out + 1] = n end
+      else
+        local id = resolveTextAction(v, actions, room)
+        if not id then return nil end
+        out[#out + 1] = id
+      end
+    else
+      return nil
+    end
+  end
+  return out
+end
+
 -- 每个请求类型期望选几个动作
 local EXPECTED_COUNT = {
   askForUseCard = 1, askForCard = 1, askForChooseCard = 1,
@@ -143,6 +356,11 @@ local EXPECTED_COUNT = {
 -- 主入口：raw 是 LLM 原始字符串，actions 是 Actions.enumerate 的结果
 -- 返回 (响应, nil) 或 (nil, 错误原因)
 function Parse.response(raw, req, room, actions)
+  -- curl 子进程失败时，stderr 会以 "curl: (28) ..." 的形式混进原始输出。
+  -- 报成「不是合法 JSON」会误导排查方向（那是网络，不是模型）。
+  if type(raw) == "string" and raw:find("^curl: ", 1) then
+    return nil, "接口调用失败（网络）：" .. (raw:match("^[^\n]+") or raw)
+  end
   local me = req.player
   local data = extractJson(raw)
   local ids = data and normalizeIds(data)
@@ -162,6 +380,15 @@ function Parse.response(raw, req, room, actions)
     if fixed then
       data = fixed
       ids = normalizeIds(data)
+    end
+  end
+  -- 编号不可用但 action 字段在：按候选标签做文本模糊匹配
+  -- （弱模型会把 "出C2-杀" 这类标签抄进 action；C2-杀 本就是候选的牌面）
+  if not ids and type(data) == "table" and (data.action ~= nil or data.actions ~= nil) then
+    ids = resolveTextIds(data, actions, room)
+    if not ids then
+      local t = type(data.action) == "string" and data.action or tostring(data.action or "")
+      return nil, string.format("动作文本无法对应合法动作：%s（请回候选编号）", t)
     end
   end
   if not ids then
