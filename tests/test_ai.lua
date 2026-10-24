@@ -986,6 +986,35 @@ do -- fromEnv：模型名按模式区分——直连必配游戏侧，代理模�
         SGS_AI_KEY = "sk-test", SGS_AI_MODEL = "m", SGS_AI_THINKING = "on" }),
     })
     check(t6 ~= nil and t6.chat_thinking == "on", "SGS_AI_THINKING=on 应显式开启")
+
+    -- SGS_AI_TEMPERATURE：透传 + 非法值报错（kimi-k2.8 只认 0.6 实测引出）
+    local t7 = AirTrans.fromEnv({
+      env = envWith({ SGS_AI_URL = "https://llm.example.com/v1/chat/completions",
+        SGS_AI_KEY = "sk-test", SGS_AI_MODEL = "kimi", SGS_AI_TEMPERATURE = "0.6" }),
+    })
+    check(t7 ~= nil and t7.temperature == 0.6,
+      "SGS_AI_TEMPERATURE=0.6 应透传到传输层（实得 " .. tostring(t7 and t7.temperature) .. "）")
+    local t8, err8 = AirTrans.fromEnv({
+      env = envWith({ SGS_AI_URL = "https://llm.example.com/v1/chat/completions",
+        SGS_AI_KEY = "sk-test", SGS_AI_MODEL = "m", SGS_AI_TEMPERATURE = "hot" }),
+    })
+    check(t8 == nil and tostring(err8):find("SGS_AI_TEMPERATURE", 1, true) ~= nil,
+      "SGS_AI_TEMPERATURE 非数字应报错（实得 " .. tostring(err8) .. "）")
+    local t9 = AirTrans.fromEnv({
+      env = envWith({ SGS_AI_URL = "https://llm.example.com/v1/chat/completions",
+        SGS_AI_KEY = "sk-test", SGS_AI_MODEL = "m" }),
+    })
+    check(t9 ~= nil and t9.temperature == 0.2,
+      "未配置时应保持默认 0.2（实得 " .. tostring(t9 and t9.temperature) .. "）")
+
+    -- 温度限制识别：kimi-k2.8 的报错原文要能提取出 0.6
+    local allowed = Transport.allowedTemperature(
+      "The request is invalid: invalid temperature: only 0.6 is allowed for this model. "
+      .. "Please check the request body, required fields, and request format.")
+    check(allowed == 0.6, "kimi 温度报错应提取出 0.6（实得 " .. tostring(allowed) .. "）")
+    check(Transport.allowedTemperature("curl: (28) timeout") == nil,
+      "无关错误不应误判为温度限制")
+    check(Transport.allowedTemperature(nil) == nil, "nil 输入安全返回 nil")
   end
 end
 

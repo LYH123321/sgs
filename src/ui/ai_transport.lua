@@ -138,6 +138,8 @@ function Threaded:init(opts)
   self.waiting = false
   self.discard = 0     -- 已取消但还会回来的结果数量
   self.last_error = nil
+  self.last_prompt = nil -- 温度自愈重发时要用回同一个提示词
+  self.temp_healed = false
 end
 
 -- 请求体交给 core 的统一实现，chat / responses 的差异只在一处维护
@@ -148,6 +150,7 @@ end
 function Threaded:submit(prompt)
   if self.thread:getError() then return false end
   -- 只传字符串：Channel 没法序列化函数，prompt 里的 view/actions 带对象
+  self.last_prompt = prompt
   self.inbox:push({
     mode = self.mode,
     body = self:_body(prompt),
@@ -169,7 +172,23 @@ function Threaded:poll()
   end
   self.waiting = false
   local res = Curl.parse(out, self.protocol)
-  if not res.ok then self.last_error = res.err end
+  if not res.ok then
+    self.last_error = res.err
+    -- 温度自愈：个别模型只接受特定 temperature（kimi-k2.8 只认 0.6），
+    -- 默认 0.2 会被整批 400 拒绝。识别出允许值后改用它重发**同一个
+    -- 提示词**，对上层表现为「还在思考」，之后的所有请求一直沿用。
+    if not self.temp_healed then
+      local allowed = TransportLib.allowedTemperature(res.err)
+      if allowed and allowed ~= self.temperature then
+        self.temp_healed = true
+        self.temperature = allowed
+        print(string.format("[AI] 接口要求 temperature=%s，已自动调整并重试", allowed))
+        if self.last_prompt and self:submit(self.last_prompt) then
+          return nil
+        end
+      end
+    end
+  end
   return res
 end
 
@@ -279,6 +298,7 @@ local function fromEnv(opts)
       model = model,
       reasoning_effort = effort,
       chat_thinking = chat_thinking,
+      temperature = temperature,
       timeout = timeout,
     }), nil
   end
@@ -289,6 +309,13 @@ local function fromEnv(opts)
   -- 不受这条限制）
   local url = env("SGS_AI_URL")
   local key = env("SGS_AI_KEY") or env("OPENAI_API_KEY")
+  -- 采样温度：默认 0.2（决策求稳）。个别模型只允许特定值（kimi-k2.8
+  -- 只认 0.6），可用 SGS_AI_TEMPERATURE 显式指定；运行期被接口拒绝时
+  -- 传输层还会按报错自动改用允许值重试（见 Threaded:poll）。
+  local temperature = tonumber(env("SGS_AI_TEMPERATURE") or "") or nil
+  if env("SGS_AI_TEMPERATURE") and not temperature then
+    return nil, "SGS_AI_TEMPERATURE 不是数字：" .. tostring(env("SGS_AI_TEMPERATURE"))
+  end
   if not url or url == "" then
     return nil, "未设置 SGS_AI_URL（模型接口地址）"
   end
@@ -307,6 +334,7 @@ local function fromEnv(opts)
     model = model,
     reasoning_effort = effort,
     chat_thinking = chat_thinking,
+    temperature = temperature,
     timeout = timeout,
   }), nil
 end

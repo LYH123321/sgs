@@ -57,6 +57,7 @@ export SGS_AI_REASONING="none"      # ← 关键，见下
 | `SGS_AI_PROTOCOL` | 接口形态 `chat` / `responses` | 按 URL 猜，默认 `responses` |
 | `SGS_AI_REASONING` | 思维链强度 `none` / `low` / ...（Responses 协议） | `none` |
 | `SGS_AI_THINKING` | chat 协议思维链（GLM 系）：`off` / `on` / `auto`（不发字段） | 跟随 AI 思考档 |
+| `SGS_AI_TEMPERATURE` | 采样温度（默认 0.2；kimi-k2.8 这类只允许特定值的模型可在此指定，运行期被拒也会自动改用允许值重试） | `0.2` |
 
 ### 两个关键注意点
 

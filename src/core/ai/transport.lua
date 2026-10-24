@@ -36,6 +36,14 @@ local Transport = {}
 --   传 "low" 不被识别（会退回默认 high），传顶层 reasoning_effort 完全无效。
 local DEFAULT_PROTOCOL = "chat"
 
+-- 从接口报错里提取「该模型只允许的 temperature」。
+-- 实测 kimi-k2.8-preview：`invalid temperature: only 0.6 is allowed
+-- for this model`——发 0.2 会被整批拒绝。返回 nil 表示错误与温度无关。
+function Transport.allowedTemperature(err)
+  if type(err) ~= "string" then return nil end
+  return tonumber(err:match("only (%d+%.?%d*) is allowed"))
+end
+
 local function buildBody(self, prompt)
   local protocol = self.protocol or DEFAULT_PROTOCOL
   -- jev 协议（TypeSafe System One）：请求体就是 state/questions 表，
