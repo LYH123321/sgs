@@ -1,0 +1,23 @@
+# SGS Android build artifacts
+.gradle/
+build/
+local.properties
+*.iml
+.idea/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Key store (never commit)
+keystore.jks
+*.jks
+*.keystore
+
+# APK outputs
+*.apk
+*.aab
+*.apks
+*.zip
+
+# Android Studio
+*.hprof
