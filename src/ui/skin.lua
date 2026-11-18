@@ -13,32 +13,53 @@ local Skin = class("Skin")
 
 -- 资源根：**默认用项目自带的 assets/**，不再引用原 QSanguosha 源码目录。
 -- 仅当显式设置 SGS_ASSET_ROOT 时才指向别处（便于调试或用完整原版资源）。
--- 注意：这里只能用 io.open，不能用下面的 readFile —— 那是个 local，
--- 声明在 findRoot 之后，此处不在其作用域内。
+-- 资源根探测：必须在「目录」和「.love 打包」两种形态下都工作。
+-- 目录用 io.open，打包后 assets/ 在 zip 里、io.open 读不到，只能走
+-- love.filesystem（physfs）。两条都试，谁先命中用谁。
+local function probe(path)
+  -- 1) 物理文件（开发时从项目根启动、或 SGS_ASSET_ROOT 指向目录）
+  local f = io.open(path, "r")
+  if f then
+    f:close()
+    return true
+  end
+  -- 2) zip 内（.love / fused 包 / Android 的 assets/game.love）
+  if love and love.filesystem then
+    local ok, info = pcall(love.filesystem.getInfo, path)
+    if ok and info then return true end
+  end
+  return false
+end
+
+local LAYOUT_FILE = "skins/defaultSkin.layout.json"
+
 local function hasLayout(root)
-  local f = io.open(root .. "/skins/defaultSkin.layout.json", "r")
-  if not f then return false end
-  f:close()
-  return true
+  if not root then return false end
+  return probe(root .. "/" .. LAYOUT_FILE)
 end
 
 local function findRoot()
   local env = os.getenv("SGS_ASSET_ROOT")
   if env and env ~= "" and hasLayout(env) then return env end
-  -- love.filesystem.getSource()：项目目录的绝对路径，与进程 CWD 无关
-  -- （从别的目录/快捷方式启动时 CWD 不可靠，Windows 上尤其常见）。
-  -- skin 层承诺不碰 love.graphics/audio；filesystem 只读路径，无副作用，
-  -- headless 测试没有 love 时 pcall 安全跳过。
+
+  -- love.filesystem.getSource() 返回项目根目录，或（打包后）.
+  -- love/.exe 文件本身的路径。
+  --   • 目录形式：资源在 <src>/assets 下，也可能是 <src> 本身
+  --   • 打包形式：src 是个文件，拼它没用，资源根就是包内的 "assets"
+  -- 两种情况下面兜底的相对路径都能命中，所以打包时直接跳过前缀拼。
   if love and love.filesystem then
     local ok, src = pcall(love.filesystem.getSource)
     if ok and type(src) == "string" and src ~= "" then
       src = src:gsub("\\", "/")
-      -- getSource 是项目根，资源在其 assets/ 下； fused 包（.love/.exe）
-      -- 则直接以包内文件为根
-      if hasLayout(src .. "/assets") then return src .. "/assets" end
-      if hasLayout(src) then return src end
+      local looksPackaged = src:lower():match("%.love$") or src:lower():match("%.exe$")
+      if not looksPackaged then
+        if hasLayout(src .. "/assets") then return src .. "/assets" end
+        if hasLayout(src) then return src end
+      end
     end
   end
+
+  -- 包内相对路径（打包场景）或 CWD 相对路径（开发场景）
   for _, r in ipairs({ "assets", "./assets" }) do
     if hasLayout(r) then return r end
   end
@@ -46,11 +67,18 @@ local function findRoot()
 end
 
 local function readFile(path)
+  -- 目录：直接读；打包：io.open 读不到 zip 内文件，退回 love.filesystem
   local f = io.open(path, "r")
-  if not f then return nil end
-  local content = f:read("*a")
-  f:close()
-  return content
+  if f then
+    local content = f:read("*a")
+    f:close()
+    return content
+  end
+  if love and love.filesystem then
+    local ok, content = pcall(love.filesystem.read, path)
+    if ok and type(content) == "string" then return content end
+  end
+  return nil
 end
 
 local function loadJson(root, name)
@@ -66,6 +94,11 @@ local warned_no_root = false
 
 function Skin:init(root)
   self.root = root or findRoot()
+  -- 显式传入但不存在的根目录，等价于「没有资源」：置 nil 让所有查询降级。
+  -- （测试用 Skin.create("/nonexistent") 验证降级路径，依赖这个语义。）
+  if self.root and not hasLayout(self.root) then
+    self.root = nil
+  end
   if not self.root and not warned_no_root then
     warned_no_root = true
     print("[assets] 资源根目录未找到（assets/skins/*.json）：图片与音频全部"

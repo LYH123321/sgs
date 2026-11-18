@@ -13,22 +13,29 @@ end
 local current_scene = nil
 local Scale = require "src.ui.scale"
 
-local startGame, startNet, backToMenu
+local startGame, startNet, backToMenu, openSettings
 local startNetScene
 
 -- ai_mode: "off" / "others" / "all"，由菜单上的 AI 托管按钮决定；
 -- draft: 是否开局选将（文档开局流程：主公 5 选 1、其余 3 选 1），
 --   由菜单上的「开局选将」开关决定；
 -- ai_reasoning: "none" / "low" / "high"，菜单「AI 思考」开关，覆盖 SGS_AI_REASONING
-startGame = function(mode, size, ai_mode, draft, ai_reasoning)
+startGame = function(mode, size, ai_mode, draft, ai_reasoning, ai_persona)
   local RoomScene = require "src.ui.scene_room"
   current_scene = RoomScene.create(backToMenu, mode, size, ai_mode,
-    { draft = draft ~= false, ai_reasoning = ai_reasoning })
+    { draft = draft ~= false, ai_reasoning = ai_reasoning,
+      ai_persona = ai_persona })
 end
 
 backToMenu = function()
   local MenuScene = require "src.ui.scene_menu"
-  current_scene = MenuScene.create(startGame, startNet)
+  current_scene = MenuScene.create(startGame, startNet, openSettings)
+end
+
+-- AI 设置页：安卓上没有 SGS_AI_* 环境变量，只能靠这个界面配
+openSettings = function()
+  local SettingsScene = require "src.ui.scene_settings"
+  current_scene = SettingsScene.create(backToMenu)
 end
 
 -- 联机：连上服务端后进入联机牌桌
@@ -117,6 +124,8 @@ function love.load()
 end
 
 function love.keypressed(key, scancode, isrepeat)
+  -- 安卓返回键 = escape：优先给场景处理（关弹层/收起键盘），
+  -- 主菜单不拦，让系统退回桌面。
   -- 全屏切换（desktop 模式不改分辨率，切换即时无黑屏）：
   --   F11 / Alt+Enter：Windows、Linux 惯用
   --   Cmd+Enter / Ctrl+Cmd+F：macOS 惯用（F11 默认被系统「显示桌面」拦截）
@@ -133,6 +142,15 @@ function love.keypressed(key, scancode, isrepeat)
   end
   if current_scene and current_scene.keypressed then
     current_scene:keypressed(key)
+  end
+end
+
+-- 软键盘输入：设置页、联机聊天等需要文本输入的场景实现 textinput。
+-- 安卓上 love.keyboard.setTextInput(true) 会弹出系统输入法，
+-- 字符通过这个回调回来（不是 keypressed）。
+function love.textinput(t)
+  if current_scene and current_scene.textinput then
+    current_scene:textinput(t)
   end
 end
 
@@ -157,6 +175,23 @@ end
 function love.mousepressed(x, y, button)
   if current_scene and current_scene.mousepressed then
     current_scene:mousepressed(x, y, button)
+  end
+end
+
+-- 触摸转发：SDL 会把触摸也合成鼠标事件，但只监听 mousepressed 的场景
+-- 在部分安卓设备上收不到（触摸被 SDL 当作 touch 事件消费）。
+-- 这里补一层，保证点按既能当触摸也能当鼠标用。
+function love.touchpressed(id, x, y, dx, dy, pressure)
+  if current_scene and current_scene.mousepressed then
+    local w, h = love.graphics.getDimensions()
+    current_scene:mousepressed(x * w, y * h, 1)
+  end
+end
+
+function love.touchreleased(id, x, y, dx, dy, pressure)
+  if current_scene and current_scene.mousereleased then
+    local w, h = love.graphics.getDimensions()
+    current_scene:mousereleased(x * w, y * h, 1)
   end
 end
 

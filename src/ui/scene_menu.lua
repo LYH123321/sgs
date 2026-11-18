@@ -4,6 +4,7 @@
 -- 布局随窗口尺寸居中自适应（relayout），点击判定与绘制用同一套矩形。
 local class = require "src.class"
 local Scale = require "src.ui.scale"
+local Persona = require "src.core.ai.persona"
 local S = Scale.px
 
 local MenuScene = class("MenuScene")
@@ -33,9 +34,10 @@ local KINGDOMS = {
   { zh = "群", color = { 0.55, 0.56, 0.49 } },
 }
 
-function MenuScene:init(on_start, on_net)
+function MenuScene:init(on_start, on_net, on_settings)
   self.on_start = on_start
   self.on_net = on_net
+  self.on_settings = on_settings
   local font_path = FONT_PATH
   self.font_title, self.font_seal, self.font_wm,
     self.font, self.font_sm = buildFonts()
@@ -90,6 +92,28 @@ function MenuScene:init(on_start, on_net)
     color = BTN_SLATE, text = "AI 思考：关", desc = "" }
   self:refreshThinkButton()
 
+  -- 设置入口：AI 接口 / 模型 / 性格。安卓上没有环境变量，必须能在这里改。
+  self.settings_button = { w = 300, h = 48, color = BTN_SLATE,
+    text = "AI 设置", desc = "接口 · 密钥 · 模型 · 性格" }
+
+  -- 性格选择（点一下循环）
+  local cfg = nil
+  if love and love.filesystem then
+    local ok, Cfg = pcall(require, "src.ui.ai_config")
+    if ok and Cfg then
+      local ok2, c = pcall(Cfg.load)
+      if ok2 then cfg = c end
+    end
+  end
+  self.persona_index = 1
+  local cur_persona = cfg and cfg.persona or "none"
+  for i, p in ipairs(Persona.ALL) do
+    if p.key == cur_persona then self.persona_index = i end
+  end
+  self.persona_button = { w = 300, h = 48, color = BTN_SLATE,
+    text = "AI 性格：" .. Persona.ALL[self.persona_index].label,
+    desc = "点一下切换（酒馆式人设）" }
+
   self.t = 0
   self:relayout(love.graphics.getDimensions())
 end
@@ -129,13 +153,21 @@ function MenuScene:relayout(w, h)
   self.draft_button.w, self.draft_button.h = cw, S(48)
   self.think_button.x, self.think_button.y = cx + (cw + gap3) * 2, cy
   self.think_button.w, self.think_button.h = cw, S(48)
+  -- 第四行：AI 性格 + AI 设置
+  local sy = cy + S(48) + S(26)
+  self.persona_button.x, self.persona_button.y = cx, sy
+  self.persona_button.w, self.persona_button.h = cw, S(48)
+  self.settings_button.x = cx + (cw + gap3) * 2
+  self.settings_button.y = sy
+  self.settings_button.w, self.settings_button.h = cw, S(48)
   self.row_y = math.floor(h * 0.48) -- 供 draw 画开关说明行
 end
 
 function MenuScene:refreshAIButton()
   local m = self.ai_modes[self.ai_index]
   self.ai_button.text = "AI 托管：" .. m.label
-  self.ai_button.desc = m.desc .. "（需设置 SGS_AI_URL / SGS_AI_KEY）"
+  -- 不再提环境变量：安卓上没有，统一指向设置页
+  self.ai_button.desc = m.desc .. "（接口在「AI 设置」里配）"
   self.ai_button.on = self.ai_index ~= 1
 end
 
@@ -300,6 +332,9 @@ function MenuScene:draw()
     love.graphics.printf(b.desc, b.x - S(20), self.row_y + S(170) + b.h + S(8),
       b.w + S(40), "center")
   end
+  -- 设置入口（没有状态点，当作普通按钮画）
+  self:drawButton(self.persona_button)
+  self:drawButton(self.settings_button)
 
   -- ===== 页脚 =====
   love.graphics.setColor(0.5, 0.55, 0.5)
@@ -332,13 +367,25 @@ function MenuScene:mousepressed(x, y, button)
     return
   end
 
+  if pointIn(self.settings_button, x, y) then
+    if self.on_settings then self.on_settings() end
+    return
+  end
+
+  if pointIn(self.persona_button, x, y) then
+    self.persona_index = (self.persona_index % #Persona.ALL) + 1
+    self.persona_button.text = "AI 性格：" .. Persona.ALL[self.persona_index].label
+    return
+  end
+
   for _, b in ipairs(self.buttons) do
     if pointIn(b, x, y) then
       if b.net then
         if self.on_net then self.on_net() end
       else
         self.on_start(b.mode, b.size, self.ai_modes[self.ai_index].key,
-          self.draft_on, self.think_modes[self.think_index].key)
+          self.draft_on, self.think_modes[self.think_index].key,
+          Persona.ALL[self.persona_index].key)
       end
       return
     end

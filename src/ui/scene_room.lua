@@ -125,6 +125,9 @@ function RoomScene:init(on_exit, mode, size, ai_mode, opts)
   -- 菜单「AI 思考」开关（none/low/high），覆盖 SGS_AI_REASONING；
   -- beginPlay 建 Agent 时消费。AI 推测 feed 在 beginPlay 后随时可推。
   self.ai_reasoning = opts and opts.ai_reasoning or nil
+  -- AI 性格：来自菜单「AI 性格」按钮或 ai_config.json，拼进 system 提示词。
+  -- nil / "none" = 不加任何性格描述（保持原行为）。
+  self.ai_persona = opts and opts.ai_persona or nil
   self.aiFeed = {}   -- AI 推测变化流 {kind=belief|think, text=, turn=}
   self.aiPopup = nil -- 「AI 推测」详情弹层（点按钮列打开）
 
@@ -309,6 +312,7 @@ function RoomScene:beginPlay()
     engine = engine,
     transport_jev = transport_jev,
     jev_min_confidence = jev_conf,
+    persona = self.ai_persona,
     timeout = engine == "jev" and 20 or (thinking_on and 140 or nil),
     -- 「正在思考」提示里的名字与面板同款（AI（武将）/BOT（武将））
     name_of = function(p) return self:displayName(p) end,

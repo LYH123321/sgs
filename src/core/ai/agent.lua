@@ -77,6 +77,9 @@ function Agent:init(opts)
   self.timeout = opts.timeout or 30
   self.clock = opts.clock or os.time
   self.memory_on = opts.memory ~= false
+  -- 性格：只改 system 提示词里的风格描述，不影响规则与身份目标。
+  -- 见 core/ai/persona.lua；默认 nil = 不加任何性格描述。
+  self.persona = opts.persona
   self.max_steps = opts.max_steps or 60
   self.on_decision = opts.on_decision
   self.on_error = opts.on_error
@@ -183,6 +186,7 @@ function Agent:_buildPrompt(req, room, actions, memory, hint, engine)
     memory = memory,
     nameOf = makeNameOf(room),
     retry_hint = hint,
+    persona = self.persona,
   })
 end
 

@@ -8,6 +8,7 @@
 --      所以要求写死在 system 里，解析侧也做了兜底（见 parse.lua）。
 local Json = require "src.core.json"
 local View = require "src.core.ai.view"
+local Persona = require "src.core.ai.persona"
 
 local Prompt = {}
 
@@ -128,7 +129,8 @@ function Prompt.build(room, req, actions, opts)
   parts[#parts + 1] = FORMAT
 
   return {
-    system = Prompt.SYSTEM,
+    -- 性格只影响语气与风险偏好，规则与身份目标不变（见 core/ai/persona.lua）
+    system = Persona.apply(Prompt.SYSTEM, opts.persona),
     user = table.concat(parts, "\n"),
     view = view,      -- 便于测试断言与调试
     actions = actions,
