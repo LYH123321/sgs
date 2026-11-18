@@ -1,8 +1,21 @@
 /*
  * Copyright (c) 2006-2024 LOVE Development Team
- * Modifications for SGS Android port: GPL-3.0
  *
- * Licensed under the same license as the original LOVE Android project.
+ * This software is provided 'as-is', without any express or implied
+ * warranty.  In no event will the authors be held liable for any damages
+ * arising from the use of this software.
+ *
+ * Permission is granted to anyone to use this software for any purpose,
+ * including commercial applications, and to alter it and redistribute it
+ * freely, subject to the following restrictions:
+ *
+ * 1. The origin of this software must not be misrepresented; you must not
+ *    claim that you wrote the original software. If you use this software
+ *    in a product, an acknowledgment in the product documentation would be
+ *    appreciated but is not required.
+ * 2. Altered source versions must be plainly marked as such, and must not be
+ *    misrepresented as being the original software.
+ * 3. This notice may not be removed or altered from any source distribution.
  */
 
 package org.love2d.android;
@@ -29,18 +42,14 @@ import androidx.core.app.ActivityCompat;
 
 import org.libsdl.app.SDLActivity;
 
-import java.io.File;
 import java.io.FileNotFoundException;
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Map;
 
-/**
- * SGS Android port — based on love-android-sdl2 GameActivity.
- * Adds HttpTransport initialization for AI HTTPS via OkHttp file queue.
- */
 public class GameActivity extends SDLActivity {
     private static final String TAG = "GameActivity";
     public static final int RECORD_AUDIO_REQUEST_CODE = 3;
@@ -57,14 +66,23 @@ public class GameActivity extends SDLActivity {
     @Override
     protected String getMainSharedObject() {
         String[] libs = getLibraries();
+        // Since Lollipop, you can simply pass "libname.so" to dlopen
+        // and it will resolve correct paths and load correct library.
+        // This is mandatory for extractNativeLibs=false support in
+        // Marshmallow.
         return "lib" + libs[libs.length - 1] + ".so";
     }
 
     @Override
     protected String[] getLibraries() {
         return new String[]{
-            "c++_shared", "SDL3", "oboe", "openal",
-            "luajit", "liblove", "love",
+            "c++_shared",
+            "SDL3",
+            "oboe",
+            "openal",
+            "luajit",
+            "liblove",
+            "love",
         };
     }
 
@@ -75,44 +93,48 @@ public class GameActivity extends SDLActivity {
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
-        Log.d(TAG, "SGS Android: onCreate");
+        Log.d(TAG, "started");
         isFused = hasEmbeddedGame();
         args = new String[0];
 
-        if (checkCallingOrSelfPermission(Manifest.permission.VIBRATE)
-                == PackageManager.PERMISSION_GRANTED) {
+        if (checkCallingOrSelfPermission(Manifest.permission.VIBRATE) == PackageManager.PERMISSION_GRANTED) {
             vibrator = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
         }
 
         Intent intent = getIntent();
         handleIntent(intent, true);
+        // Prevent SDL sending filedropped event. Let us do that instead.
         intent.setData(null);
 
         super.onCreate(savedInstanceState);
 
-        if (mBrokenLibraries) return;
+        if (mBrokenLibraries) {
+            return;
+        }
 
+        // Set low-latency audio values
         nativeSetDefaultStreamValues(getAudioFreq(), getAudioSMP());
 
         if (android.os.Build.VERSION.SDK_INT >= 28) {
             WindowManager.LayoutParams attr = getWindow().getAttributes();
-            attr.layoutInDisplayCutoutMode =
-                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_NEVER;
+            attr.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_NEVER;
             shortEdgesMode = false;
         }
 
-        // ── 初始化 SGS HttpTransport 文件队列 ──────────────────────
-        // love.filesystem.getSaveDirectory() 在 Java 层对应:
-        //   /data/data/com.sgs.game/files/
-        File saveDir = new File(getFilesDir(), "sgs_save");
-        if (!saveDir.exists()) saveDir.mkdirs();
-        HttpTransport.initialize(saveDir);
-        Log.d(TAG, "HttpTransport initialized: " + saveDir.getAbsolutePath());
-
         if (delayedUri != null) {
+            // This delayed fd is only sent if an embedded game is present.
             sendUriAsDroppedFile(delayedUri);
             delayedUri = null;
         }
+
+        // ── SGS Android: start the AI HTTPS transport ─────────────
+        // The queue lives inside love.filesystem's save dir so Lua can reach it
+        // with plain love.filesystem.write/read (LÖVE on Android exposes no
+        // generic Java bridge).
+        File saveDir = new File(getFilesDir(), "save");
+        if (!saveDir.exists()) saveDir.mkdirs();
+        HttpTransport.initialize(saveDir);
+        Log.d(TAG, "HttpTransport queue at " + new File(saveDir, HttpTransport.QUEUE_DIR));
     }
 
     @Override
@@ -123,54 +145,81 @@ public class GameActivity extends SDLActivity {
 
     @Override
     protected void onDestroy() {
-        if (vibrator != null) vibrator.cancel();
+        HttpTransport.shutdown();
+
+        if (vibrator != null) {
+            Log.d(TAG, "Cancelling vibration");
+            vibrator.cancel();
+        }
+
         super.onDestroy();
     }
 
     @Override
     protected void onPause() {
-        if (vibrator != null) vibrator.cancel();
+        if (vibrator != null) {
+            Log.d(TAG, "Cancelling vibration");
+            vibrator.cancel();
+        }
         super.onPause();
     }
 
     @Override
-    public void onRequestPermissionsResult(int requestCode, String[] permissions,
-                                            int[] grantResults) {
-        if (grantResults.length > 0 && requestCode == RECORD_AUDIO_REQUEST_CODE) {
-            synchronized (recordAudioRequestDummy) {
-                recordAudioRequestDummy[0] = grantResults[0];
-                recordAudioRequestDummy.notify();
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        if (grantResults.length > 0) {
+            Log.d("GameActivity", "Received a request permission result");
+
+            if (requestCode == RECORD_AUDIO_REQUEST_CODE) {
+                if (grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                    Log.d("GameActivity", "Mic permission granted");
+                } else {
+                    Log.d("GameActivity", "Did not get mic permission.");
+                }
+
+                Log.d("GameActivity", "Unlocking LÖVE thread");
+                synchronized (recordAudioRequestDummy) {
+                    recordAudioRequestDummy[0] = grantResults[0];
+                    recordAudioRequestDummy.notify();
+                }
+            } else {
+                super.onRequestPermissionsResult(requestCode, permissions, grantResults);
             }
-        } else {
-            super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         }
     }
-
-    // ── LÖVE 原生方法接口（love.* 调用）────────────────────────────
 
     @Keep
     public boolean hasEmbeddedGame() {
         AssetManager am = getAssets();
+        InputStream inputStream;
+
         try {
-            am.open("main.lua");
-            return true;
+            // Prioritize main.lua in assets folder
+            inputStream = am.open("main.lua");
         } catch (IOException e) {
+            // Not found, try game.love in assets folder
             try {
-                am.open("game.love");
-                return true;
+                inputStream = am.open("game.love");
             } catch (IOException e2) {
+                // Not found
                 return false;
             }
         }
+
+        try {
+            inputStream.close();
+        } catch (IOException ignored) {
+        }
+
+        return true;
     }
 
     @Keep
     public void vibrate(double seconds) {
         if (vibrator != null) {
-            long duration = (long) (seconds * 1000.0);
+            long duration = (long) (seconds * 1000.);
             if (android.os.Build.VERSION.SDK_INT >= 26) {
-                vibrator.vibrate(VibrationEffect.createOneShot(
-                    duration, VibrationEffect.DEFAULT_AMPLITUDE));
+                VibrationEffect ve = VibrationEffect.createOneShot(duration, VibrationEffect.DEFAULT_AMPLITUDE);
+                vibrator.vibrate(ve);
             } else {
                 vibrator.vibrate(duration);
             }
@@ -179,48 +228,78 @@ public class GameActivity extends SDLActivity {
 
     @Keep
     public boolean hasBackgroundMusic() {
-        AudioManager am = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
-        return am != null && am.isMusicActive();
+        AudioManager audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+        return audioManager.isMusicActive();
+    }
+
+    @Keep
+    public String[] buildFileTree() {
+        // Map key is path, value is directory flag
+        HashMap<String, Boolean> map = buildFileTree(getAssets(), "", new HashMap<>());
+        ArrayList<String> result = new ArrayList<>();
+
+        for (Map.Entry<String, Boolean> data : map.entrySet()) {
+            result.add((data.getValue() ? "d" : "f") + data.getKey());
+        }
+
+        String[] r = new String[result.size()];
+        result.toArray(r);
+        return r;
     }
 
     @Keep
     public float getDPIScale() {
-        return getResources().getDisplayMetrics().density;
+        DisplayMetrics metrics = getResources().getDisplayMetrics();
+        return metrics.density;
     }
 
     @Keep
     public Rect getSafeArea() {
+        Rect rect = null;
+
         if (android.os.Build.VERSION.SDK_INT >= 28) {
-            DisplayCutout cutout = getWindow().getDecorView()
-                .getRootWindowInsets().getDisplayCutout();
+            DisplayCutout cutout = getWindow().getDecorView().getRootWindowInsets().getDisplayCutout();
+
             if (cutout != null) {
-                Rect rect = new Rect();
-                rect.set(cutout.getSafeInsetLeft(), cutout.getSafeInsetTop(),
-                    cutout.getSafeInsetRight(), cutout.getSafeInsetBottom());
-                return rect;
+                rect = new Rect();
+                rect.set(
+                    cutout.getSafeInsetLeft(),
+                    cutout.getSafeInsetTop(),
+                    cutout.getSafeInsetRight(),
+                    cutout.getSafeInsetBottom()
+                );
             }
         }
-        return null;
+
+        return rect;
     }
 
     @Keep
     public String getCRequirePath() {
-        ApplicationInfo appInfo = getApplicationInfo();
+        ApplicationInfo applicationInfo = getApplicationInfo();
+
         if (isNativeLibsExtracted()) {
-            return appInfo.nativeLibraryDir + "/?.so";
+            return applicationInfo.nativeLibraryDir + "/?.so";
+        } else {
+            // The native libs are inside the APK and can be loaded directly.
+            // FIXME: What about split APKs?
+            String abi = android.os.Build.SUPPORTED_ABIS[0];
+            return applicationInfo.sourceDir + "!/lib/" + abi + "/?.so";
         }
-        String abi = android.os.Build.SUPPORTED_ABIS[0];
-        return appInfo.sourceDir + "!/lib/" + abi + "/?.so";
     }
 
     @Keep
     public void setImmersiveMode(boolean enable) {
         if (android.os.Build.VERSION.SDK_INT >= 28) {
             WindowManager.LayoutParams attr = getWindow().getAttributes();
-            attr.layoutInDisplayCutoutMode = enable
-                ? WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
-                : WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_NEVER;
+
+            if (enable) {
+                attr.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+            } else {
+                attr.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_NEVER;
+            }
         }
+
         shortEdgesMode = enable;
     }
 
@@ -231,98 +310,136 @@ public class GameActivity extends SDLActivity {
 
     @Keep
     public boolean hasRecordAudioPermission() {
-        return ActivityCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
-            == PackageManager.PERMISSION_GRANTED;
+        return ActivityCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED;
     }
 
     @Keep
     public void requestRecordAudioPermission() {
-        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
-                == PackageManager.PERMISSION_GRANTED) return;
+        if (ActivityCompat.checkSelfPermission(this,
+            Manifest.permission.RECORD_AUDIO)
+            == PackageManager.PERMISSION_GRANTED) {
+            return;
+        }
+
+        Log.d("GameActivity", "Requesting mic permission and locking LÖVE thread until we have an answer.");
+        ActivityCompat.requestPermissions(this,
+            new String[]{Manifest.permission.RECORD_AUDIO},
+            RECORD_AUDIO_REQUEST_CODE);
 
         synchronized (recordAudioRequestDummy) {
-            ActivityCompat.requestPermissions(this,
-                new String[]{Manifest.permission.RECORD_AUDIO},
-                RECORD_AUDIO_REQUEST_CODE);
-            try { recordAudioRequestDummy.wait(); } catch (InterruptedException e) {}
+            try {
+                recordAudioRequestDummy.wait();
+            } catch (InterruptedException e) {
+                Log.d("GameActivity", "requesting mic permission", e);
+            }
         }
     }
 
     public int getAudioSMP() {
+        int smp = 256;
         AudioManager a = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
-        int b = a != null
-            ? Integer.parseInt(a.getProperty(AudioManager.PROPERTY_OUTPUT_FRAMES_PER_BUFFER))
-            : 0;
-        return b > 0 ? b : 256;
+
+        if (a != null) {
+            int b = Integer.parseInt(a.getProperty(AudioManager.PROPERTY_OUTPUT_FRAMES_PER_BUFFER));
+            smp = b > 0 ? b : smp;
+        }
+
+        return smp;
     }
 
     public int getAudioFreq() {
+        int freq = 44100;
         AudioManager a = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
-        int b = a != null
-            ? Integer.parseInt(a.getProperty(AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE))
-            : 0;
-        return b > 0 ? b : 44100;
+
+        if (a != null) {
+            int b = Integer.parseInt(a.getProperty(AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE));
+            freq = b > 0 ? b : freq;
+        }
+
+        return freq;
     }
 
     public boolean isNativeLibsExtracted() {
-        return (getApplicationInfo().flags & ApplicationInfo.FLAG_EXTRACT_NATIVE_LIBS) != 0;
+        ApplicationInfo appInfo = getApplicationInfo();
+        return (appInfo.flags & ApplicationInfo.FLAG_EXTRACT_NATIVE_LIBS) != 0;
     }
 
     public void sendUriAsDroppedFile(Uri uri) {
         SDLActivity.onNativeDropFile(uri.toString());
     }
 
-    // ── SGS AI 传输层：Java → Lua 入口 ─────────────────────────────
-    // Lua 通过 love.android.callJava("GameActivity", "httpRequest",
-    //   callbackId, method, url, headersJson, body, timeoutMs)
-    // 调用本方法，把请求写入文件队列。
-
-    /**
-     * 把 HTTP 请求加入文件队列。
-     * Lua 线程轮询队列目录获取结果，完全异步不阻塞主线程。
-     *
-     * @param callbackId  Lua 侧 UUID（用于匹配请求和结果）
-     * @param method      "POST" 或 "GET"
-     * @param url         完整请求 URL
-     * @param headersJson JSON 对象 {"Key":"Value"}
-     * @param body        请求体字符串
-     * @param timeoutMs   超时毫秒，≤0 使用默认 30000
-     */
-    @Keep
-    public void httpRequest(
-            String callbackId,
-            String method,
-            String url,
-            String headersJson,
-            String body,
-            int timeoutMs
-    ) {
-        HttpTransport.enqueue(callbackId, method, url, headersJson, body, timeoutMs);
-    }
-
-    // ── Intent 处理 ───────────────────────────────────────────────
-
     private void handleIntent(Intent intent, boolean onCreate) {
         Uri game = intent.getData();
-        if (game == null) return;
+        if (game == null) {
+            return;
+        }
 
         if (onCreate) {
+            // Game is not running
             if (isFused) {
+                // Send it as dropped file later
                 delayedUri = game;
             } else {
+                // Process for arguments
                 processOpenGame(game);
             }
         } else {
+            // Game is already running. Send it as dropped file.
             sendUriAsDroppedFile(game);
         }
     }
 
+    private HashMap<String, Boolean> buildFileTree(AssetManager assetManager, String dir, HashMap<String, Boolean> map) {
+        String strippedDir = dir.endsWith("/") ? dir.substring(0, dir.length() - 1) : dir;
+
+        // Try open dir
+        try {
+            InputStream test = assetManager.open(strippedDir);
+            // It's a file
+            test.close();
+            map.put(strippedDir, false);
+        } catch (FileNotFoundException e) {
+            // It's a directory
+            String[] list = null;
+
+            // List files
+            try {
+                list = assetManager.list(strippedDir);
+            } catch (IOException e2) {
+                Log.e(TAG, strippedDir, e2);
+            }
+
+            // Mark as file
+            map.put(dir, true);
+
+            if (!strippedDir.equals(dir)) {
+                map.put(strippedDir, true);
+            }
+
+            if (list != null) {
+                for (String path : list) {
+                    buildFileTree(assetManager, dir + path + "/", map);
+                }
+            }
+        } catch (IOException e) {
+            Log.e(TAG, dir, e);
+        }
+
+        return map;
+    }
+
     private void processOpenGame(Uri game) {
         String scheme = game.getScheme();
-        if ("content".equals(scheme)) {
-            args = new String[]{game.toString()};
-        } else if ("file".equals(scheme)) {
-            args = new String[]{game.getPath()};
+        String path = game.getPath();
+
+        if (scheme != null) {
+            if (scheme.equals("content")) {
+                // Pass content URI as-is.
+                args = new String[]{game.toString()};
+            } else if (scheme.equals("file")) {
+                // Regular file, pass as-is.
+                args = new String[]{path};
+            }
         }
     }
 }

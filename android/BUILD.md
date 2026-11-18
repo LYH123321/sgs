@@ -1,314 +1,134 @@
-# SGS Android 构建指南
+# SGS Android 版
 
-## 环境要求
+把 SGS（三国杀）包装成可安装的安卓 APK。壳基于
+[love2d/love-android](https://github.com/love2d/love-android)（zlib 许可），
+游戏本体打包成 `game.love` 内嵌。
 
-| 组件 | 版本 | 说明 |
-|------|------|------|
-| JDK | 17 或 21 | Android Gradle Plugin 8.x 需要 JDK 17+ |
-| Android SDK | API 35 | compileSdk=35, targetSdk=35, minSdk=24 |
-| Gradle | 9.6 | 通过 gradle-wrapper.properties 自动下载 |
-| Android NDK | r26+ | 编译 SDL3 / LÖVE native 库 |
+## 目录结构
 
-**不需要 Ubuntu/Linux。** Windows、macOS、Linux 均可构建，全链路 Java + Gradle 跨平台。
+```
+android/
+├── app/
+│   ├── build.gradle                       # 应用模块（含 SGS 的 OkHttp 依赖）
+│   └── src/
+│       ├── embed/assets/game.love         # 内嵌的游戏包（26 MB）
+│       ├── main/java/org/love2d/android/
+│       │   ├── GameActivity.java          # 上游壳 + SGS 初始化钩子
+│       │   ├── HttpTransport.java         # 【新增】OkHttp HTTPS 传输层
+│       │   └── IntentReceiverActivity.java
+│       └── main/cpp/                      # CMake 入口（native 源码见下）
+├── gradle.properties                      # 应用名 / 包名 / 横屏
+└── gradlew
+```
 
----
-
-## 快速构建（有 Android Studio 的情况）
+`app/src/main/cpp/love/` 和 `app/src/main/cpp/megasource/`（约 420 MB 的
+LÖVE + SDL3 源码）**不入库**，由构建前拉取：
 
 ```bash
-cd android/
-
-# Debug 构建（直接安装测试用）
-./gradlew assembleDebug
-
-# Release 构建（需要签名，见下文）
-./gradlew assembleRelease
+cd android/app/src/main/cpp
+git clone --filter=blob:none https://github.com/love2d/love.git love
+git -C love checkout ef388d4371f5932491fbdcdd65ac7240e11c31a8
+git clone https://github.com/love2d/megasource.git megasource
+git -C megasource checkout 14937cda16712142223af85301d261153a35719b
 ```
 
-APK 输出路径：
-```
-android/app/build/outputs/apk/debug/app-debug.apk
-android/app/build/outputs/apk/release/app-release.apk
-```
+## 构建
 
----
+CI（`.github/workflows/build-android.yml`）在每次推送 `android` 分支时自动
+构建，产物在 Actions 页面的 `sgs-android-debug` artifact 里。
 
-## 命令行构建（无 Android Studio）
-
-### 1. 安装 Android SDK Command Line Tools
-
-```bash
-# 下载（约 150MB，Google 可能需要科学上网）
-mkdir -p ~/android-sdk/cmdline-tools
-cd ~/android-sdk/cmdline-tools
-# 从 https://developer.android.com/studio#command-tools 下载最新 zip
-unzip commandlinetools-*.zip
-mv cmdline-tools latest
-
-# 设置环境变量
-export ANDROID_HOME=~/android-sdk
-export PATH=$ANDROID_HOME/cmdline-tools/latest/bin:$PATH
-```
-
-### 2. 安装 SDK 组件
-
-```bash
-sdkmanager "platforms;android-35" \
-           "build-tools;35.0.0" \
-           "platform-tools" \
-           "ndk;26.1.10909125"
-```
-
-### 3. 接受许可协议
-
-```bash
-sdkmanager --licenses
-```
-
-### 4. 配置 local.properties
-
-```bash
-echo "sdk.dir=$ANDROID_HOME" > android/local.properties
-```
-
-### 5. 构建
+本地构建：
 
 ```bash
 cd android
-./gradlew assembleRelease
+./gradlew assembleEmbedRecordDebug
+# 产物：app/build/outputs/apk/embedRecord/debug/app-embed-record-debug.apk
 ```
 
----
+首次构建需要 **NDK 30.0.16248370**、**CMake ≥ 3.25**、**JDK 17**，
+并完整编译 SDL3 + LÖVE + LuaJIT，干净环境下 20~40 分钟。
 
-## 签名配置
+## AI 功能怎么走 HTTPS
 
-### 生成 keystore（仅首次）
+这是整个移植里唯一真正需要动代码的地方。
 
-```bash
-keytool -genkey -v \
-  -keystore android/keystore.jks \
-  -keyalg RSA -keysize 2048 -validity 10000 \
-  -alias sgs \
-  -dname "CN=SGS, OU=Game, O=SGS, L=Beijing, ST=Beijing, C=CN" \
-  -storepass android -keypass android
+**问题**：LÖVE 的 LuaSocket 在安卓上不带 luasec，`ssl.https` 直接
+require 失败；`io.popen("curl")` 也不可行——安卓没有系统 curl，且应用
+数据目录是 noexec。
+
+**方案**：把 HTTPS 交给 Java 层的 OkHttp，Lua 与 Java 通过存档目录做文件
+队列通信。之所以不用 JNI，是因为 LÖVE for Android 没有通用的「Lua 调
+Java」桥（只有 `love.system.vibrate` 这类几个手写包装）。
+
+```
+Lua  → love.filesystem.write("http_queue/<id>.json")   {"method","url","headers","timeout"}
+     → love.filesystem.write("http_queue/<id>.body")   请求体
+Java → HttpTransport 每 100ms 扫目录 → OkHttp 发请求
+     → 写 "http_queue/<id>.res"  {"statusCode","body","error"}
+Lua  → 每帧 getInfo 检查 .res → 读到即删 → 解析
 ```
 
-### 环境变量方式（推荐，密钥不进代码）
+代码位置：
+- `android/.../HttpTransport.java` — 扫描队列、执行请求、写回结果
+- `src/ui/transport_android.lua` — Lua 侧实现，接口与桌面版
+  `ui/ai_transport.lua` 的 `Threaded` 完全一致（`submit` / `poll` /
+  `cancel` / `isAlive`）
+- `src/ui/ai_transport.lua` 的 `fromEnv` 在检测到 `love.system.getOS()
+  == "Android"` 时自动切到它
 
-```bash
-export KEYSTORE_PASSWORD=你的密码
-export KEY_ALIAS=你的别名
-export KEY_PASSWORD=你的密钥密码
-./gradlew assembleRelease
-```
+### 配置
 
-> `keystore.jks` 已在 build.gradle.kts 中引用。如果不存在，构建时会生成 debug 签名。
-
----
-
-## SGS 游戏代码接入
-
-Android 壳通过 assets/game/ 目录加载 LÖVE 游戏。
-
-### 方式 A：.love 文件（推荐，体积小）
-
-```bash
-# 1. 把 sgs/ 打包成 .love
-cd sgs/
-# 创建临时目录，拷贝游戏文件（排除 Android 相关文件）
-mkdir -p ../build_love
-rsync -a --exclude='android' --exclude='.git' ./ ../build_love/
-cd ../build_love && zip -r ../android/app/src/main/assets/game.love . && cd ..
-
-# 2. Android 壳在启动时自动检测 assets/game.love 并加载
-```
-
-### 方式 B：散文件（调试方便）
-
-```bash
-# 直接把 sgs 源码复制到 assets/game/
-cp -r sgs/* android/app/src/main/assets/game/
-# GameActivity 检测到 main.lua 存在时优先加载散文件
-```
-
-### 方式 C：外部 .love 文件（不内置）
-
-```bash
-# 构建时不打包任何游戏代码，运行时通过 Intent 打开外部 .love
-# 在 AndroidManifest 中已声明 .love 文件的 intent-filter
-./gradlew assembleRelease
-# 然后手动 adb push 一个 .love 文件到手机，点击打开
-```
-
----
-
-## AI 传输层配置
-
-首次启动时，Android 壳会自动在保存目录创建 `ai_config.json` 模板：
+安卓上没有 `SGS_AI_*` 环境变量。首次启动会在存档目录生成
+`ai_config.json`，填好后重启：
 
 ```json
 {
-  "provider": "openai",
   "base_url": "https://api.openai.com/v1",
   "api_key": "sk-...",
   "model": "gpt-4o",
   "protocol": "chat",
-  "timeout": 30000,
-  "temperature": 0.7,
+  "timeout": 90,
+  "temperature": 0.2,
   "effort": "none",
-  "reasoning": true
+  "thinking": "off"
 }
 ```
 
-编辑此文件填入有效的 API 密钥和模型名即可使用 AI 功能。
+存档目录：`/data/data/com.sgs.game/files/save/ai_config.json`
+（`love.filesystem.getSaveDirectory()`）。用 adb 取出编辑：
 
-### 各平台配置示例
-
-| 平台 | base_url | protocol | model |
-|------|----------|----------|-------|
-| OpenAI | `https://api.openai.com/v1` | `chat` | `gpt-4o` |
-| Azure OpenAI | `https://你的资源.openai.azure.com/openai/deployments/部署名` | `chat` | `gpt-4o` |
-| DeepSeek | `https://api.deepseek.com/v1` | `chat` | `deepseek-chat` |
-| Ollama（本地） | `http://localhost:11434/v1` | `chat` | `llama3` |
-| Responses API | `https://api.openai.com/v1` | `responses` | `o1` |
-
----
-
-## 文件结构
-
-```
-android/
-├── settings.gradle.kts         # Gradle 项目设置
-├── build.gradle.kts            # 根级构建配置
-├── gradle.properties           # Gradle 属性
-├── gradlew                     # Gradle 启动脚本 (Linux/macOS)
-├── gradlew.bat                 # Gradle 启动脚本 (Windows)
-├── gradle/wrapper/
-│   └── gradle-wrapper.properties
-├── keystore.jks                # 签名密钥（自行生成）
-├── local.properties            # SDK 路径（自行创建，不入 git）
-├── app/
-│   ├── build.gradle.kts        # 应用模块配置
-│   ├── proguard-rules.pro      # ProGuard 混淆规则
-│   └── src/main/
-│       ├── AndroidManifest.xml
-│       ├── assets/
-│       │   ├── game.love       # 打包的 LÖVE 游戏（方式 A）
-│       │   └── game/           # 或散文件（方式 B）
-│       ├── java/org/love2d/android/
-│       │   ├── GameActivity.java
-│       │   ├── HttpTransport.java
-│       │   └── IntentReceiverActivity.java
-│       └── res/
-│           └── values/
-│               └── strings.xml
-├── transport_android.lua       # Lua 侧 AI 传输层（放到 sgs/src/ui/ 或 sgs/src/core/ai/）
-└── BUILD.md                    # 本文件
+```bash
+adb shell run-as com.sgs.game cat files/save/ai_config.json
 ```
 
----
+支持 `chat`（OpenAI/DeepSeek/Ollama 等）和 `responses`（o1/hy3）两种协议。
+
+## 已经做好的适配
+
+| 项 | 处理 |
+|---|---|
+| 横屏 | `gradle.properties` 里 `app.orientation=landscape` |
+| 缩放 | 游戏自带 `scale.lua` 常量级缩放，1130×650 设计稿在手机横屏自适应 |
+| 触摸 | SDL 把触摸自动映射成鼠标事件 |
+| 刘海屏 | 上游 `getSafeArea()` 已实现 |
+| 返回键 | 映射成 `escape`（LÖVE 默认行为） |
+| 震动 | `love.system.vibrate` 走 Java |
 
 ## 已知限制
 
-1. **HttpTransport 使用文件队列**：Lua 线程通过轮询 `.res` 文件获取结果，轮询间隔 ~50ms。对于 1~3 秒的 LLM 请求，这个延迟可忽略。
+1. **未在 CI 上验证过完整构建**——首次跑通前可能需要微调 NDK/CMake 版本。
+2. **AI 请求有约 100ms~200ms 的队列延迟**——相对 LLM 本身 1~3 秒可忽略。
+3. **素材协议**：`assets/` 下的三国杀美术是 CC BY-NC-ND，禁止商用（含
+   广告/内购）。自己装着玩没问题，上架商店必须先换掉素材。
+4. **GPL-3.0**：游戏本体是 GPL-3.0，衍生的壳代码与 Lua 胶水同样需以
+   GPL-3.0 发布。
 
-2. **native `.so` 未修改**：SDL3/liblove 使用官方 love-android-sdl2 预编译版本。如果需要修改 native 行为（例如 JNI 回调），需要重新编译 SDL3 + LÖVE native 源码。
+## 测试
 
-3. **AI 请求在 Java 线程执行**：OkHttp 在 `HttpTransport-Worker` HandlerThread 中异步执行，不阻塞 SDL 主线程。
-
-4. **素材协议**：CC BY-NC-ND 素材不可用于任何商业用途（含广告/内购）。上架商店需替换美术资源。
-
-5. **GPL-3.0 合规**：移植代码、Java 桥、Lua 胶水代码均需以 GPL-3.0 发布。
-
----
-
-## 故障排查
-
-### GFW 封锁 Google SDK
+Lua 侧传输层有离线单测（mock 掉 love.filesystem）：
 
 ```bash
-# 使用国内镜像
-export SDK_TEST_BASE_URL=https://mirrors.cloud.tencent.com/AndroidSDK
-sdkmanager "platforms;android-35" ...
-```
-
-或使用 Android Studio（内置下载器通常能自动切换镜像）。
-
-### gradlew 权限问题
-
-```bash
-chmod +x android/gradlew
-```
-
-### NDK 版本不匹配
-
-```bash
-# 查看已安装版本
-sdkmanager --list_installed
-
-# 指定版本
-sdkmanager "ndk;26.1.10909125"
-# 然后在 build.gradle.kts 中指定 ndkVersion = "26.1.10909125"
-```
-
-### OkHttp 混淆问题
-
-`proguard-rules.pro` 中已包含 OkHttp 保留规则。如果 release 构建后 AI 功能崩溃，检查：
-1. `HttpTransport.java` 是否被 ProGuard 保留（`-keep class org.love2d.android.**`）
-2. OkHttp 内部类是否完整保留
-
----
-
-## 一键构建脚本
-
-Linux/macOS：
-
-```bash
-#!/bin/bash
-set -e
-cd "$(dirname "$0")"
-
-echo "=== SGS Android 一键构建 ==="
-
-# 1. 打包 .love
-echo "[1/4] 打包游戏代码..."
-cd ../sgs
-rm -f ../android/app/src/main/assets/game.love
-zip -r ../android/app/src/main/assets/game.love \
-  . -x "android/*" ".git/*" "tests/*" "docs/*"
-cd ../android
-
-# 2. 构建 Release APK
-echo "[2/4] 构建 Release APK..."
-./gradlew assembleRelease
-
-# 3. 复制 APK 到根目录
-echo "[3/4] 复制 APK..."
-cp app/build/outputs/apk/release/app-release.apk ../SGS-Android.apk
-
-echo "[4/4] 完成！"
-echo "APK: android/app/build/outputs/apk/release/app-release.apk"
-ls -lh ../SGS-Android.apk
-```
-
-Windows：
-
-```bat
-@echo off
-echo === SGS Android 一键构建 ===
-
-echo [1/4] 打包游戏代码...
-cd ..\sgs
-if exist ..\android\app\src\main\assets\game.love del ..\android\app\src\main\assets\game.love
-powershell -Command "Compress-Archive -Path * -DestinationPath ..\android\app\src\main\assets\game.love -Force" 
-cd ..\android
-
-echo [2/4] 构建 Release APK...
-call gradlew.bat assembleRelease
-
-echo [3/4] 复制 APK...
-copy app\build\outputs\apk\release\app-release.apk ..\SGS-Android.apk
-
-echo [4/4] 完成！
-dir ..\SGS-Android.apk
+cd ..        # 回到 sgs 仓库根目录
+lua5.1 tests/test_transport_android.lua
+# ===== 40 passed, 0 failed =====
 ```

@@ -265,6 +265,23 @@ end
 local function fromEnv(opts)
   opts = opts or {}
   local env = opts.env or os.getenv
+
+  -- Android：没有 SGS_AI_* 环境变量，HTTPS 也不能走 curl/socket，
+  -- 统一交给 Java(OkHttp) 的文件队列实现，配置读存档目录下的 ai_config.json。
+  -- 注入 env 的情况（单测）不算，保持桌面行为。
+  if not opts.env then
+    local okOs, osName = pcall(function() return love.system.getOS() end)
+    if okOs and osName == "Android" then
+      local okMod, AndroidTransport = pcall(require, "src.ui.transport_android")
+      if okMod and AndroidTransport then
+        if opts.reasoning then
+          return AndroidTransport.fromConfig({ reasoning = opts.reasoning })
+        end
+        return AndroidTransport.fromConfig()
+      end
+    end
+  end
+
   local engine = env("SGS_AI_ENGINE")
   if engine == "jev" or (engine == "mixed" and opts.engine_only == "jev") then
     return jevFromEnv(env)

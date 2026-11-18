@@ -1,4 +1,4 @@
-# SGS Android build artifacts
+# Gradle / Android build outputs
 .gradle/
 build/
 local.properties
@@ -7,17 +7,20 @@ local.properties
 captures/
 .externalNativeBuild/
 .cxx/
+fastlane/report.xml
+fastlane/screenshots/
 
-# Key store (never commit)
-keystore.jks
+# Native sources pulled in by CI / build.sh (submodules, ~420 MB).
+# Never commit them; see README for the pinned commits.
+app/src/main/cpp/love/
+app/src/main/cpp/megasource/
+
+# Signing material
 *.jks
 *.keystore
+keystore.properties
 
-# APK outputs
+# Artifacts
 *.apk
 *.aab
-*.apks
-*.zip
-
-# Android Studio
-*.hprof
+*.ap_

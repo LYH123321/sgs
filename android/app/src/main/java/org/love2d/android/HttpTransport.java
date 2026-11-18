@@ -1,21 +1,29 @@
 /*
- * SGS Android — AI 传输层：OkHttp HTTPS 桥（文件队列方案）
+ * SGS Android — AI transport: OkHttp HTTPS bridge (directory-poll based)
  * GPL-3.0
  *
- * 零 native 改动，纯 Java + Lua 协作：
+ * Why this exists: LÖVE on Android ships without luasec, so socket.http /
+ * ssl.https cannot talk to an HTTPS LLM endpoint. io.popen("curl") is also
+ * impossible (no system curl, and app data dirs are mounted noexec).
  *
- *   Lua线程写请求 → 文件 http_queue/<uuid>.req
- *              ↓ FileObserver 感知
- *   Java Handler 读文件 → OkHttp 执行 → 写 http_queue/<uuid>.res
- *              ↓
- *   Lua线程轮询 .res 文件 → 解析 JSON → 触发回调
+ * LÖVE for Android exposes no generic "call Java from Lua" bridge (only a
+ * handful of hand-written JNI wrappers such as love.system.vibrate), so the
+ * two sides communicate through the only thing they share for free:
+ * love.filesystem's save directory.
  *
- * 文件路径为 GameActivity 传入的 saveDir/http_queue/，
- * 与 love.filesystem.getSaveDirectory() 对齐。
+ *   Lua  : love.filesystem.write("http_queue/<id>.json", descriptor)
+ *          love.filesystem.write("http_queue/<id>.body", requestBody)
+ *   Java : this class polls that directory, runs the request with OkHttp and
+ *          writes "http_queue/<id>.res"
+ *   Lua  : polls love.filesystem.getInfo("<id>.res"), reads and removes it
+ *
+ * descriptor = {"method":"POST","url":"https://…","headers":{"K":"V"},"timeout":30000}
+ * result     = {"statusCode":200,"body":"…","error":""}
+ *
+ * Everything runs off the SDL thread; the game never blocks on network I/O.
  */
 package org.love2d.android;
 
-import android.os.FileObserver;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.util.Log;
@@ -28,7 +36,9 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
 import okhttp3.Call;
@@ -40,193 +50,234 @@ import okhttp3.RequestBody;
 import okhttp3.Response;
 import okhttp3.ResponseBody;
 
-/**
- * 纯静态工具类，HandlerThread 处理文件 IO 和网络。
- * 所有请求走文件队列，与 LÖVE SDL 线程完全解耦。
- */
 public final class HttpTransport {
-    private static final String TAG = "HttpTransport";
-    private static final String QUEUE_DIR = "http_queue";
+    private static final String TAG = "SgsHttpTransport";
+
+    /** Sub-directory of the LÖVE save dir used as the request/response queue. */
+    public static final String QUEUE_DIR = "http_queue";
+
+    private static final String EXT_DESC = ".json";
+    private static final String EXT_BODY = ".body";
+    private static final String EXT_RESULT = ".res";
+    private static final String EXT_ERROR = ".err";
+
     private static final int DEFAULT_TIMEOUT_MS = 30000;
+    private static final long POLL_INTERVAL_MS = 100;
 
     private static HandlerThread sWorkerThread;
     private static Handler sWorker;
     private static File sQueueDir;
-    private static final Map<String, Call> sPending = new HashMap<>();
+    private static volatile boolean sPolling;
+
+    private static final Map<String, Call> sPending = new ConcurrentHashMap<>();
 
     private static final OkHttpClient CLIENT = new OkHttpClient.Builder()
-            .connectTimeout(30, TimeUnit.SECONDS)
-            .readTimeout(30, TimeUnit.SECONDS)
-            .writeTimeout(30, TimeUnit.SECONDS)
+            .connectTimeout(DEFAULT_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            .readTimeout(DEFAULT_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            .writeTimeout(DEFAULT_TIMEOUT_MS, TimeUnit.MILLISECONDS)
             .retryOnConnectionFailure(false)
             .build();
 
     private HttpTransport() {}
 
-    // ─── 初始化（GameActivity.onCreate 调用）─────────────────────
+    // ── lifecycle ─────────────────────────────────────────────────────────
 
+    /**
+     * Start the queue poller.
+     *
+     * @param saveDir the LÖVE save directory, i.e. new File(getFilesDir(), "save")
+     */
     @Keep
     public static synchronized void initialize(File saveDir) {
         if (sWorkerThread != null) return;
 
-        sWorkerThread = new HandlerThread("HttpTransport");
+        sWorkerThread = new HandlerThread("SgsHttpTransport");
         sWorkerThread.start();
         sWorker = new Handler(sWorkerThread.getLooper());
 
         sQueueDir = new File(saveDir, QUEUE_DIR);
-        if (!sQueueDir.exists()) sQueueDir.mkdirs();
+        if (!sQueueDir.exists() && !sQueueDir.mkdirs()) {
+            Log.e(TAG, "cannot create queue dir: " + sQueueDir);
+        }
 
-        // 监听 .req 文件创建
-        sWorker.post(() -> {
-            FileObserver observer = new FileObserver(sQueueDir.getAbsolutePath(),
-                    FileObserver.CREATE) {
-                @Override
-                public void onEvent(int event, String path) {
-                    if (path != null && path.endsWith(".req")) {
-                        sWorker.post(() -> processRequest(path));
-                    }
-                }
-            };
-            observer.startWatching();
-            Log.d(TAG, "Watching: " + sQueueDir.getAbsolutePath());
-        });
+        sPolling = true;
+        sWorker.post(SCAN);
+
+        Log.d(TAG, "ready, queue = " + sQueueDir.getAbsolutePath());
     }
 
-    // ─── Lua 入口（love.android.callJava 调用）────────────────────
-
     @Keep
-    public static void enqueue(
-            String callbackId,
-            String method,
-            String url,
-            String headersJson,
-            String body,
-            int timeoutMs
-    ) {
-        if (sWorker == null) {
-            Log.e(TAG, "enqueue before initialize");
-            return;
-        }
-        sWorker.post(() -> {
-            String json = buildReq(callbackId, method, url, headersJson, body, timeoutMs);
+    public static synchronized void shutdown() {
+        sPolling = false;
+        if (sWorker != null) sWorker.removeCallbacks(SCAN);
+    }
+
+    // ── directory scanner ─────────────────────────────────────────────────
+
+    private static final Runnable SCAN = new Runnable() {
+        @Override
+        public void run() {
+            if (!sPolling || sQueueDir == null) return;
             try {
-                writeFile(new File(sQueueDir, callbackId + ".req"), json);
-            } catch (IOException e) {
-                Log.e(TAG, "write req failed", e);
+                scanOnce();
+            } catch (Throwable t) {
+                Log.e(TAG, "scan failed", t);
             }
-        });
+            if (sPolling) sWorker.postDelayed(this, POLL_INTERVAL_MS);
+        }
+    };
+
+    private static void scanOnce() {
+        File[] files = sQueueDir.listFiles();
+        if (files == null) return;
+
+        for (File f : files) {
+            String name = f.getName();
+            if (name.endsWith(EXT_DESC)) {
+                String id = name.substring(0, name.length() - EXT_DESC.length());
+                if (sPending.containsKey(id)) continue;          // already running
+                if (new File(sQueueDir, id + EXT_RESULT).exists()) continue; // done
+                handleDescriptor(id, f);
+            }
+        }
     }
 
-    @Keep
-    public static void cancel(String callbackId) {
-        Call call = sPending.remove(callbackId);
-        if (call != null) call.cancel();
-        // 删除待处理文件
-        File req = new File(sQueueDir, callbackId + ".req");
-        File res = new File(sQueueDir, callbackId + ".res");
-        req.delete();
-        res.delete();
-    }
-
-    // ─── 文件处理 ─────────────────────────────────────────────────
-
-    private static void processRequest(String filename) {
-        File reqFile = new File(sQueueDir, filename);
-        if (!reqFile.exists()) return;
-
-        String content;
+    private static void handleDescriptor(String id, File descFile) {
+        String desc;
         try {
-            content = readFile(reqFile);
+            desc = readFile(descFile);
         } catch (IOException e) {
-            Log.e(TAG, "read req failed", e);
-            reqFile.delete();
+            Log.e(TAG, "cannot read " + descFile.getName(), e);
+            //noinspection ResultOfMethodCallIgnored
+            descFile.delete();
+            writeResult(id, 0, "", "descriptor unreadable: " + describe(e));
             return;
         }
-        reqFile.delete();
+        //noinspection ResultOfMethodCallIgnored
+        descFile.delete();
 
-        ReqParams p = parseReq(content);
-        if (p == null || p.url == null || p.url.isEmpty()) {
-            Log.w(TAG, "bad req: " + content.substring(0, Math.min(80, content.length())));
-            String id = extractString(content, "callbackId");
-            if (id != null) writeResult(id, 0, "", "parse error");
+        String url = Json.str(desc, "url");
+        String method = Json.str(desc, "method");
+        if (url == null || url.isEmpty()) {
+            writeResult(id, 0, "", "descriptor has no url");
             return;
         }
+        int timeout = Json.integer(desc, "timeout", DEFAULT_TIMEOUT_MS);
+        Map<String, String> headers = Json.flatObject(desc, "headers");
 
-        // 构建 OkHttp 请求
-        Request.Builder b = new Request.Builder().url(p.url);
-        if ("GET".equalsIgnoreCase(p.method)) {
-            b.get();
-        } else {
-            b.post(RequestBody.create(
-                p.body != null ? p.body : "",
-                MediaType.parse("application/json; charset=utf-8")));
-        }
-
-        if (p.headers != null) {
-            for (Map.Entry<String, String> h : p.headers.entrySet()) {
-                b.addHeader(h.getKey(), h.getValue());
+        String body = "";
+        File bodyFile = new File(sQueueDir, id + EXT_BODY);
+        if (bodyFile.exists()) {
+            try {
+                body = readFile(bodyFile);
+            } catch (IOException e) {
+                writeResult(id, 0, "", "body unreadable: " + describe(e));
+                //noinspection ResultOfMethodCallIgnored
+                bodyFile.delete();
+                return;
             }
-        }
-        if (p.headers == null || !p.headers.containsKey("Content-Type")) {
-            b.addHeader("Content-Type", "application/json; charset=utf-8");
-        }
-        if (p.headers == null || !p.headers.containsKey("Accept")) {
-            b.addHeader("Accept", "application/json");
+            //noinspection ResultOfMethodCallIgnored
+            bodyFile.delete();
         }
 
-        Request request = b.build();
-        int timeout = p.timeout > 0 ? p.timeout : DEFAULT_TIMEOUT_MS;
+        execute(id, method, url, headers, body, timeout);
+    }
+
+    // ── request execution (worker thread) ─────────────────────────────────
+
+    private static void execute(String id, String method, String url,
+                                Map<String, String> headers, String body, int timeout) {
+        boolean get = "GET".equalsIgnoreCase(method);
+        Request.Builder rb = new Request.Builder().url(url);
+
+        if (get) {
+            rb.get();
+        } else {
+            rb.post(RequestBody.create(body, MediaType.parse("application/json; charset=utf-8")));
+        }
+
+        for (Map.Entry<String, String> e : headers.entrySet()) {
+            rb.header(e.getKey(), e.getValue());
+        }
+        if (!get && !headers.containsKey("Content-Type")) {
+            rb.header("Content-Type", "application/json; charset=utf-8");
+        }
+        if (!headers.containsKey("Accept")) {
+            rb.header("Accept", "application/json");
+        }
+
         OkHttpClient client = CLIENT.newBuilder()
                 .connectTimeout(timeout, TimeUnit.MILLISECONDS)
                 .readTimeout(timeout, TimeUnit.MILLISECONDS)
                 .writeTimeout(timeout, TimeUnit.MILLISECONDS)
                 .build();
 
-        Call call = client.newCall(request);
-        sPending.put(p.callbackId, call);
+        Call call = client.newCall(rb.build());
+        sPending.put(id, call);
+        Log.d(TAG, "→ " + (get ? "GET" : "POST") + " " + url + "  [" + id + "]");
 
         call.enqueue(new Callback() {
             @Override
             public void onFailure(Call c, IOException e) {
-                sPending.remove(p.callbackId);
-                Log.e(TAG, "HTTP fail " + p.callbackId + ": " + e.getMessage());
-                writeResult(p.callbackId, 0, "", e.getMessage());
+                sPending.remove(id);
+                Log.w(TAG, "← network error [" + id + "] " + describe(e));
+                writeResult(id, 0, "", describe(e));
             }
 
             @Override
-            public void onResponse(Call c, Response response) throws IOException {
-                sPending.remove(p.callbackId);
-                int code = response.code();
-                String respBody;
-                try (ResponseBody rb = response.body()) {
-                    respBody = rb != null ? rb.string() : "";
+            public void onResponse(Call c, Response response) {
+                sPending.remove(id);
+                String text = "";
+                try (ResponseBody rb2 = response.body()) {
+                    if (rb2 != null) text = rb2.string();
+                } catch (IOException e) {
+                    writeResult(id, 0, "", describe(e));
+                    return;
                 }
-                String err = response.isSuccessful() ? "" : "HTTP " + code;
-                writeResult(p.callbackId, code, respBody, err);
+                int code = response.code();
+                Log.d(TAG, "← HTTP " + code + " [" + id + "] " + text.length() + " bytes");
+                writeResult(id, code, text, response.isSuccessful() ? "" : "HTTP " + code);
             }
         });
     }
 
-    // ─── 结果文件写入 ─────────────────────────────────────────────
+    /** Cancel an in-flight request and drop its queue files. */
+    @Keep
+    public static void cancel(String id) {
+        if (id == null || sQueueDir == null) return;
+        Call call = sPending.remove(id);
+        if (call != null) call.cancel();
+        for (String ext : new String[]{EXT_DESC, EXT_BODY, EXT_RESULT}) {
+            //noinspection ResultOfMethodCallIgnored
+            new File(sQueueDir, id + ext).delete();
+        }
+    }
 
-    private static void writeResult(String callbackId, int code,
-                                     String body, String error) {
-        sWorker.post(() -> {
-            String json = String.format(
-                "{\"callbackId\":\"%s\",\"statusCode\":%d,\"body\":%s,\"error\":\"%s\"}",
-                callbackId, code,
-                jsonStr(body != null ? body : ""),
-                escapeStr(error != null ? error : "")
-            );
+    // ── result file ───────────────────────────────────────────────────────
+
+    private static void writeResult(String id, int code, String body, String error) {
+        Handler w = sWorker;
+        if (w == null) return;
+        w.post(() -> {
+            String json = "{\"statusCode\":" + code
+                    + ",\"body\":" + Json.quote(body == null ? "" : body)
+                    + ",\"error\":" + Json.quote(error == null ? "" : error)
+                    + "}";
+            File res = new File(sQueueDir, id + EXT_RESULT);
             try {
-                writeFile(new File(sQueueDir, callbackId + ".res"), json);
+                writeFile(res, json);
             } catch (IOException e) {
-                Log.e(TAG, "write res failed", e);
+                Log.e(TAG, "cannot write result for " + id, e);
             }
         });
     }
 
-    // ─── 文件 IO ─────────────────────────────────────────────────
+    private static String describe(Exception e) {
+        String msg = e.getMessage();
+        return (msg == null || msg.isEmpty()) ? e.getClass().getSimpleName() : msg;
+    }
+
+    // ── file helpers ──────────────────────────────────────────────────────
 
     private static void writeFile(File f, String content) throws IOException {
         try (FileOutputStream fos = new FileOutputStream(f)) {
@@ -238,117 +289,143 @@ public final class HttpTransport {
         byte[] buf = new byte[(int) f.length()];
         try (FileInputStream fis = new FileInputStream(f)) {
             int n = fis.read(buf);
-            return new String(buf, 0, n, StandardCharsets.UTF_8);
+            return new String(buf, 0, Math.max(n, 0), StandardCharsets.UTF_8);
         }
     }
 
-    // ─── JSON 解析（手写，无第三方库）────────────────────────────
+    // ── minimal JSON reader (no third-party dependency) ───────────────────
 
-    private static String buildReq(String id, String method, String url,
-                                    String headersJson, String body, int timeout) {
-        return "{\"callbackId\":\"" + escapeStr(id) + "\"" +
-               ",\"method\":\"" + escapeStr(method != null ? method : "POST") + "\"" +
-               ",\"url\":\"" + escapeStr(url) + "\"" +
-               ",\"headers\":" + (headersJson != null && !headersJson.isEmpty()
-                                   ? headersJson : "{}") +
-               ",\"body\":\"" + escapeStr(body != null ? body : "") + "\"" +
-               ",\"timeout\":" + timeout + "}";
-    }
+    static final class Json {
+        private Json() {}
 
-    private static final class ReqParams {
-        String callbackId = "";
-        String method = "POST";
-        String url = "";
-        Map<String, String> headers;
-        String body = "";
-        int timeout = 0;
-    }
-
-    private static ReqParams parseReq(String json) {
-        ReqParams p = new ReqParams();
-        String id = extractString(json, "callbackId");
-        if (id != null) p.callbackId = id;
-        String method = extractString(json, "method");
-        if (method != null) p.method = method;
-        String url = extractString(json, "url");
-        if (url == null) return null;
-        p.url = url;
-        String body = extractString(json, "body");
-        p.body = body != null ? body : "";
-
-        // timeout
-        int ti = json.indexOf("\"timeout\"");
-        if (ti >= 0) {
-            int colon = json.indexOf(":", ti);
-            int end = json.indexOf(",", colon);
-            if (end < 0) end = json.indexOf("}", colon);
-            try {
-                p.timeout = (int) Double.parseDouble(json.substring(colon + 1, end).trim());
-            } catch (Exception ignored) {}
-        }
-
-        // headers
-        int hi = json.indexOf("\"headers\"");
-        if (hi >= 0) {
-            int colon = json.indexOf(":", hi);
-            int brace = colon;
-            // skip whitespace
-            while (brace < json.length() && json.charAt(brace) != '{') brace++;
-            int close = findClose(json, brace);
-            if (brace < close) {
-                p.headers = new HashMap<>();
-                String hdr = json.substring(brace + 1, close);
-                int i = 0;
-                while (i < hdr.length()) {
-                    int ks = hdr.indexOf("\"", i);
-                    if (ks < 0) break;
-                    int ke = hdr.indexOf("\"", ks + 1);
-                    if (ke < 0) break;
-                    String key = hdr.substring(ks + 1, ke);
-                    int vs = hdr.indexOf("\"", ke + 1);
-                    if (vs < 0) break;
-                    int ve = hdr.indexOf("\"", vs + 1);
-                    if (ve < 0) break;
-                    p.headers.put(key, hdr.substring(vs + 1, ve));
-                    i = ve + 1;
+        static String quote(String s) {
+            if (s == null) return "\"\"";
+            StringBuilder sb = new StringBuilder(s.length() + 16).append('"');
+            for (int i = 0; i < s.length(); i++) {
+                char c = s.charAt(i);
+                switch (c) {
+                    case '"': sb.append("\\\""); break;
+                    case '\\': sb.append("\\\\"); break;
+                    case '\n': sb.append("\\n"); break;
+                    case '\r': sb.append("\\r"); break;
+                    case '\t': sb.append("\\t"); break;
+                    default:
+                        if (c < 0x20) sb.append(String.format("\\u%04x", (int) c));
+                        else sb.append(c);
                 }
             }
+            return sb.append('"').toString();
         }
-        return p;
-    }
 
-    private static int findClose(String s, int open) {
-        int depth = 0;
-        for (int i = open; i < s.length(); i++) {
-            if (s.charAt(i) == '{') depth++;
-            else if (s.charAt(i) == '}') { depth--; if (depth == 0) return i; }
+        /** Reads a top-level string value: {"key":"value"} */
+        static String str(String json, String key) {
+            int v = valueStart(json, key);
+            if (v < 0 || v >= json.length() || json.charAt(v) != '"') return null;
+            return readString(json, v);
         }
-        return s.length() - 1;
-    }
 
-    private static String extractString(String json, String key) {
-        String qk = "\"" + key + "\"";
-        int i = json.indexOf(qk);
-        if (i < 0) return null;
-        int colon = json.indexOf(":", i + qk.length());
-        int vs = json.indexOf("\"", colon);
-        if (vs < 0) return null;
-        int ve = json.indexOf("\"", vs + 1);
-        if (ve < 0) return null;
-        return unescapeStr(json.substring(vs + 1, ve));
-    }
+        /** Reads a top-level number value. */
+        static int integer(String json, String key, int fallback) {
+            int v = valueStart(json, key);
+            if (v < 0) return fallback;
+            int p = v;
+            while (p < json.length() && "-+.0123456789eE".indexOf(json.charAt(p)) >= 0) p++;
+            try {
+                return (int) Double.parseDouble(json.substring(v, p));
+            } catch (RuntimeException e) {
+                return fallback;
+            }
+        }
 
-    private static String jsonStr(String s) {
-        return "\"" + escapeStr(s) + "\"";
-    }
+        /** Reads a flat {"K":"V", …} object value. */
+        static Map<String, String> flatObject(String json, String key) {
+            Map<String, String> out = new LinkedHashMap<>();
+            int v = valueStart(json, key);
+            if (v < 0 || v >= json.length() || json.charAt(v) != '{') return out;
 
-    private static String escapeStr(String s) {
-        return s.replace("\\", "\\\\").replace("\"", "\\\"")
-                .replace("\n", "\\n").replace("\r", "\\r");
-    }
+            int p = v + 1;
+            while (p < json.length()) {
+                while (p < json.length() && json.charAt(p) != '"' && json.charAt(p) != '}') p++;
+                if (p >= json.length() || json.charAt(p) == '}') break;
 
-    private static String unescapeStr(String s) {
-        return s.replace("\\\"", "\"").replace("\\\\", "\\")
-                .replace("\\n", "\n").replace("\\r", "\r");
+                String k = readString(json, p);
+                if (k == null) break;
+                p = skipString(json, p);
+                while (p < json.length() && json.charAt(p) != ':') p++;
+                p++;
+                while (p < json.length() && Character.isWhitespace(json.charAt(p))) p++;
+                if (p >= json.length()) break;
+
+                String val;
+                if (json.charAt(p) == '"') {
+                    val = readString(json, p);
+                    p = skipString(json, p);
+                } else {
+                    int s = p;
+                    while (p < json.length() && json.charAt(p) != ',' && json.charAt(p) != '}') p++;
+                    val = json.substring(s, p).trim();
+                }
+                if (val != null) out.put(k, val);
+            }
+            return out;
+        }
+
+        // ── internals ──
+
+        private static int valueStart(String json, String key) {
+            if (json == null) return -1;
+            String needle = "\"" + key + "\"";
+            int i = json.indexOf(needle);
+            if (i < 0) return -1;
+            int colon = json.indexOf(':', i + needle.length());
+            if (colon < 0) return -1;
+            int p = colon + 1;
+            while (p < json.length() && Character.isWhitespace(json.charAt(p))) p++;
+            return p < json.length() ? p : -1;
+        }
+
+        private static String readString(String json, int quotePos) {
+            StringBuilder sb = new StringBuilder();
+            int p = quotePos + 1;
+            while (p < json.length()) {
+                char c = json.charAt(p);
+                if (c == '\\' && p + 1 < json.length()) {
+                    char n = json.charAt(p + 1);
+                    switch (n) {
+                        case 'n': sb.append('\n'); break;
+                        case 'r': sb.append('\r'); break;
+                        case 't': sb.append('\t'); break;
+                        case 'b': sb.append('\b'); break;
+                        case 'f': sb.append('\f'); break;
+                        case 'u':
+                            if (p + 5 < json.length()) {
+                                try {
+                                    sb.append((char) Integer.parseInt(json.substring(p + 2, p + 6), 16));
+                                    p += 4;
+                                } catch (NumberFormatException ignored) { }
+                            }
+                            break;
+                        default: sb.append(n);
+                    }
+                    p += 2;
+                    continue;
+                }
+                if (c == '"') return sb.toString();
+                sb.append(c);
+                p++;
+            }
+            return sb.toString();
+        }
+
+        private static int skipString(String json, int quotePos) {
+            int p = quotePos + 1;
+            while (p < json.length()) {
+                char c = json.charAt(p);
+                if (c == '\\') { p += 2; continue; }
+                if (c == '"') return p + 1;
+                p++;
+            }
+            return p;
+        }
     }
 }
