@@ -14,12 +14,12 @@ jobs:
       GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx4G"
 
     steps:
-      # The upstream LÖVE Android shell keeps its native sources in two
-      # submodules (~420 MB). They are git-ignored in this repo, so fetch them
-      # at the exact commits this shell was taken from.
       - name: Checkout
         uses: actions/checkout@v4
 
+      # The upstream LÖVE Android shell keeps its native sources in two
+      # submodules (~420 MB). They are git-ignored in this repo, so fetch them
+      # at the exact commits this shell was taken from.
       - name: Fetch LÖVE native sources
         run: |
           set -euo pipefail
@@ -45,6 +45,23 @@ jobs:
           distribution: adopt-hotspot
           java-version: 17
           cache: gradle
+
+      # game.love is built from the repo source on every run instead of being
+      # committed, so the APK can never ship stale Lua code.
+      # Only drop what the runtime never reads: the Android shell itself, git
+      # metadata, CI config and the headless test/docs/tooling trees.
+      # NOTE: diy/ must stay - src/compat/loader.lua loads it as community
+      # expansions.
+      - name: Package game.love
+        run: |
+          set -euo pipefail
+          rm -f android/app/src/embed/assets/game.love
+          zip -r -q -X android/app/src/embed/assets/game.love . \
+            -x 'android/*' '.git/*' '.github/*' 'tests/*' 'docs/*' 'tools/*' '*.swp'
+          ls -lh android/app/src/embed/assets/game.love
+          echo "--- sanity check ---"
+          unzip -l android/app/src/embed/assets/game.love \
+            | grep -E 'transport_android\.lua|ai_transport\.lua|main\.lua|diy/'
 
       - name: Report Android SDK
         run: |

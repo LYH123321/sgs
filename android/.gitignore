@@ -24,3 +24,7 @@ keystore.properties
 *.apk
 *.aab
 *.ap_
+
+# Built from the repo source by CI (see .github/workflows/build-android.yml);
+# committing it makes it go stale whenever Lua changes.
+app/src/embed/assets/game.love
